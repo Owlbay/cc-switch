@@ -1,3 +1,9 @@
+[workspace]
+# 根 package（cc-switch 桌面 app）自动成为成员；代理引擎相关 crate 位于 crates/。
+# 设计见 docs/standalone-proxy-core-design-zh.md
+members = ["crates/*"]
+resolver = "2"
+
 [package]
 name = "cc-switch"
 version = "3.20.4"

@@ -1,0 +1,17 @@
+[package]
+name = "cc-switch-domain"
+version = "0.1.0"
+description = "Shared domain types and pure helpers for CC Switch (no IO, no Tauri)"
+authors = ["Jason Young"]
+license = "MIT"
+repository = "https://github.com/farion1231/cc-switch"
+edition = "2021"
+rust-version = "1.85.0"
+publish = false
+
+[features]
+default = []
+# 向下游 crate 暴露测试辅助（生产构建不启用）
+test-util = []
+
+[dependencies]
