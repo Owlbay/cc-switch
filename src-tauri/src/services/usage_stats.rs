@@ -2093,10 +2093,7 @@ fn log_pricing_scope_matches(log: &RequestLogDetail, target_candidates: &[String
     })
 }
 
-pub(crate) fn is_placeholder_pricing_model(model_id: &str) -> bool {
-    let normalized = model_id.trim().to_ascii_lowercase();
-    normalized.is_empty() || matches!(normalized.as_str(), "unknown" | "null" | "none")
-}
+pub(crate) use cc_switch_domain::usage_semantics::is_placeholder_pricing_model;
 
 fn query_model_pricing_exact(
     conn: &Connection,

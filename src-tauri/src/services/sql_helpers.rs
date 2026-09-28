@@ -6,30 +6,11 @@
 //! summing `input_tokens` across providers must route through
 //! [`fresh_input_sql`] to recover a consistent semantics.
 
-/// Set of `app_type` values whose stored `input_tokens` already includes
-/// `cache_read_tokens`. Aggregations subtract cache reads from these rows
-/// to recover the fresh-input semantics used by Claude.
-///
-/// Why list providers explicitly: new providers default to the
-/// Claude-style "input excludes cache" semantics, which is safer if the
-/// caller forgets to update this list. The wrong direction (a new OpenAI-
-/// style provider not added here) shows up loudly as a too-low cache hit
-/// rate, which is easier to catch than the silent over-deduction that
-/// would happen with the opposite default.
-/// 单一语义集（SSOT）：写入侧（proxy logger/calculator）、回填侧
-/// （usage_stats 成本重算）与展示侧（本文件的 SQL 归一）都必须引用这里，
-/// 防止同一语义散落多处后新增 app 时漏改（grokbuild 曾在回填侧漏掉）。
-/// 前端 `src/types/usage.ts` 的同名常量是跨语言的对应物，改动须同步。
-pub(crate) const CACHE_INCLUSIVE_APP_TYPES: &[&str] = &["codex", "gemini", "grokbuild"];
-
-/// `app_type` 的存储 `input_tokens` 是否已包含 cache read/write。
-pub(crate) fn is_cache_inclusive_app(app_type: &str) -> bool {
-    CACHE_INCLUSIVE_APP_TYPES.contains(&app_type)
-}
-
-pub(crate) const INPUT_TOKEN_SEMANTICS_LEGACY: i64 = 0;
-pub(crate) const INPUT_TOKEN_SEMANTICS_TOTAL: i64 = 1;
-pub(crate) const INPUT_TOKEN_SEMANTICS_FRESH: i64 = 2;
+/// 语义常量与判断函数定义在 `cc_switch_domain::usage_semantics`（SSOT），此处 re-export。
+pub(crate) use cc_switch_domain::usage_semantics::{
+    is_cache_inclusive_app, CACHE_INCLUSIVE_APP_TYPES, INPUT_TOKEN_SEMANTICS_FRESH,
+    INPUT_TOKEN_SEMANTICS_LEGACY, INPUT_TOKEN_SEMANTICS_TOTAL,
+};
 
 /// Build an SQL expression that returns the cache-normalized `input_tokens`
 /// for a single row in `proxy_request_logs` or `usage_daily_rollups`.

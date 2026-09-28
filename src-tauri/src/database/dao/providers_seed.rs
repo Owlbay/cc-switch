@@ -12,8 +12,7 @@
 use crate::app_config::AppType;
 
 pub(crate) const CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID: &str = "claude-desktop-official";
-pub(crate) const CODEX_OFFICIAL_PROVIDER_ID: &str = "codex-official";
-pub(crate) const GROKBUILD_OFFICIAL_PROVIDER_ID: &str = "grokbuild-official";
+pub(crate) use cc_switch_domain::{CODEX_OFFICIAL_PROVIDER_ID, GROKBUILD_OFFICIAL_PROVIDER_ID};
 
 /// 单条官方供应商种子定义。
 pub(crate) struct OfficialProviderSeed {

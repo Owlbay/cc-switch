@@ -36,7 +36,7 @@ pub const CLAUDE_ROUTE_PREFIX: &str = "claude-";
 pub const ANTHROPIC_CLAUDE_ROUTE_PREFIX: &str = "anthropic/claude-";
 /// Claude Code env 中通过 `[1M]` 后缀声明 1M 上下文能力（匹配用 `eq_ignore_ascii_case`）。
 /// Claude Desktop schema 不接受此后缀，import 边界翻译为 `supports1m` 字段。
-pub const ONE_M_CONTEXT_MARKER: &str = "[1m]";
+pub use cc_switch_domain::ONE_M_CONTEXT_MARKER;
 
 const CURRENT_OPUS_ROUTE_ID: &str = "claude-opus-5";
 const LEGACY_OPUS_ROUTE_ID: &str = "claude-opus-4-8";
