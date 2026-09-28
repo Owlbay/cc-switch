@@ -775,6 +775,7 @@ dependencies = [
  "base64 0.22.1",
  "brotli 7.0.0",
  "bytes",
+ "cc-switch-domain",
  "chrono",
  "dirs 5.0.1",
  "flate2",
@@ -840,6 +841,10 @@ dependencies = [
 [[package]]
 name = "cc-switch-domain"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "cesu8"

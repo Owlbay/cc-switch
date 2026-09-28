@@ -102,6 +102,18 @@ impl<T> From<PoisonError<T>> for AppError {
     }
 }
 
+/// domain 层错误映射到同名变体；两边 `#[error]` 模板一致，错误文本不变。
+impl From<cc_switch_domain::DomainError> for AppError {
+    fn from(err: cc_switch_domain::DomainError) -> Self {
+        match err {
+            cc_switch_domain::DomainError::Localized { key, zh, en } => {
+                Self::Localized { key, zh, en }
+            }
+            cc_switch_domain::DomainError::Message(message) => Self::Message(message),
+        }
+    }
+}
+
 impl From<rusqlite::Error> for AppError {
     fn from(err: rusqlite::Error) -> Self {
         Self::Database(err.to_string())
