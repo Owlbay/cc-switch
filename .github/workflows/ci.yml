@@ -147,13 +147,20 @@ jobs:
         run: mkdir -p dist
 
       - name: Check Rust formatting
-        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+        run: cargo fmt --all --check --manifest-path src-tauri/Cargo.toml
 
       - name: Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace -- -D warnings
+
+      - name: Check proxy core crates stay free of tauri/rusqlite
+        shell: bash
+        run: scripts/check-proxy-core-deps.sh
 
       - name: Run tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --features cc-proxy-core/test-util
+
+      - name: Run tests (test-hooks)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features test-hooks
 
   backend-windows-wsl2:
     name: Backend Checks (Windows + WSL2 home)

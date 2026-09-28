@@ -60,7 +60,7 @@ jobs:
 
       - name: Compile backend tests with native temp
         # link.exe/mt.exe cannot create manifests when TEMP points at a WSL UNC path.
-        run: cargo test --tests --manifest-path src-tauri/Cargo.toml --no-run
+        run: cargo test --tests --manifest-path src-tauri/Cargo.toml --workspace --no-run
 
       - name: Run Windows-to-WSL2 filesystem contract
         shell: pwsh
@@ -86,4 +86,4 @@ jobs:
         run: |
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
-          cargo test --tests --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+          cargo test --tests --manifest-path src-tauri/Cargo.toml --workspace -- --test-threads=1
