@@ -3,6 +3,8 @@
 > 状态：草案 v3.1（已按 P0 实施结果同步） · 基线：`origin/main@846de29c1`（2026-09-28）
 > 范围：把 `src-tauri/src/proxy` 抽成不依赖 Tauri / SQLite 的代理引擎 crate，并提供可单独运行的 headless 程序 `cc-proxy`。
 > 第二步（请求 / 响应信息改写管线）只在第 10 节给出预留接口，不在本方案实施范围内。
+>
+> **2026-09-29 方向调整**：目标改为“四个模型接口完全透传的中转，改写由独立组件控制”。P2 及之后“搬迁现有代理”的路线由 [`passthrough-relay-design-zh.md`](passthrough-relay-design-zh.md) 取代；本文的调研结论、P0 与已完成的 P1 前两步（`AppType`、共享常量迁入 domain）继续有效，P1 其余步骤暂停。
 > 文中行号均指基线 `846de29c1`，路径相对 `src-tauri/`。
 
 ## 1. 背景与结论
