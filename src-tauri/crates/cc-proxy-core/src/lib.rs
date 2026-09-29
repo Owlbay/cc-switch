@@ -6,6 +6,7 @@
 //! 设计见 `docs/passthrough-relay-design-zh.md`。
 
 pub mod auth;
+pub mod breaker;
 pub mod config;
 pub mod headers;
 pub mod interface;
