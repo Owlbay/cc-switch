@@ -19,7 +19,9 @@ base64 = "0.22"
 bytes = "1"
 cc-switch-domain = { path = "../cc-switch-domain" }
 http = "1"
+http-body = "1"
 http-body-util = "0.1"
+serde_json = "1.0"
 hyper = { version = "1", features = ["http1", "client", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "client-legacy", "client-proxy"] }
@@ -29,11 +31,11 @@ rustls-native-certs = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 subtle = "2.6"
 thiserror = "2.0"
-tokio = { version = "1", features = ["rt", "net", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt", "net", "time", "sync", "io-util"] }
 tracing = "0.1"
 url = "2.5"
 webpki-roots = "0.26"
 
 [dev-dependencies]
-serde_json = "1.0"
+httparse = "1.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -8,11 +8,16 @@
 pub mod auth;
 pub mod breaker;
 pub mod config;
+pub mod error;
+pub mod forward;
 pub mod headers;
 pub mod interface;
+pub mod server;
 pub mod tls;
 pub mod upstream;
 pub mod upstream_url;
 
 pub use config::RelayConfig;
+pub use forward::Relay;
 pub use interface::{identify, Interface};
+pub use server::serve;
