@@ -70,11 +70,9 @@ impl Relay {
         let path = parts.uri.path().to_string();
         let query = parts.uri.query().map(str::to_string);
 
-        if path.starts_with("/_relay/") {
-            return relay_error(
-                RelayErrorKind::NotFound,
-                format!("unknown relay path {path}"),
-            );
+        // 中转自身的端点先于鉴权与接口识别（§8）
+        if let Some(route) = path.strip_prefix("/_relay/") {
+            return relay_endpoint(&parts.method, route);
         }
 
         match self.auth.check(&parts.headers, query.as_deref()) {
@@ -306,6 +304,24 @@ fn relay_response(
         *out.extensions_mut() = std::mem::take(&mut parts.extensions);
     }
     out
+}
+
+/// 中转自身的端点。只有 `GET|HEAD /_relay/health`，不需要鉴权，也不暴露任何配置信息。
+fn relay_endpoint(method: &Method, route: &str) -> Response<RelayBody> {
+    if route == "health" && (method == Method::GET || method == Method::HEAD) {
+        let mut response = Response::new(crate::error::full(Bytes::from_static(
+            b"{\"status\":\"ok\"}",
+        )));
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
+    relay_error(
+        RelayErrorKind::NotFound,
+        format!("unknown relay endpoint {method} /_relay/{route}"),
+    )
 }
 
 /// `GET` / `DELETE /v1/responses/{id}` 读取或删除上游保存的响应，只能发给同一个上游。
