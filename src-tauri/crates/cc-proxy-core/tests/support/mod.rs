@@ -451,3 +451,17 @@ pub async fn start_relay(config: RelayConfig) -> RunningRelay {
         shutdown: Some(tx),
     }
 }
+
+/// 启动中转并返回停止信号与 `serve` 任务句柄，用于观察优雅退出
+pub async fn spawn_relay(
+    config: RelayConfig,
+) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let relay = Arc::new(Relay::new(&config).expect("relay config"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(serve(listener, relay, async {
+        let _ = rx.await;
+    }));
+    (addr, tx, handle)
+}
