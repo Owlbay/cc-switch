@@ -1,7 +1,7 @@
 # 透传中转 core 设计方案
 
-> 状态：草案 v3.2（已按 R3 实施结果同步）· 基线：`refactor/standalone-proxy-core@5e6abca5f`
-> 实现位置：`src-tauri/crates/cc-proxy-core/`（R1–R3 已实施；R4、R5 待做，见 §12）。
+> 状态：草案 v3.3（已按 R4 实施结果同步）· 基线：`refactor/standalone-proxy-core@5e6abca5f`
+> 实现位置：`src-tauri/crates/cc-proxy-core/`（R1–R4 已实施，R4 不含拦截器；R5 待做，见 §12）。
 > 取代：`docs/standalone-proxy-core-design-zh.md` 中 P2 及之后"搬迁现有代理"的路线。该文档的调研结论、P0（workspace 骨架）与已完成的 P1 前两步仍然有效。
 > 库行为引用的源码版本以 `src-tauri/Cargo.lock` 锁定版本为准：hyper 1.8.1、hyper-util 0.1.20、hyper-rustls 0.27.7、rustls 0.23.37、axum 0.7.9（§9）。
 > v3 中标注"原型实测"的结论来自 `/tmp/relay-proto`（锁定版本搭建的最小原型：自建 http1 accept loop + axum `fallback` + legacy Client + 原始 socket mock 上游）。R2 实际实现改用 hyper `service_fn`、不引入 axum（§9），原型中与 axum 无关的结论仍然有效，并已由集成测试重新验证。
@@ -260,6 +260,8 @@ core 自带一个精简熔断器，不复用 `src/proxy/circuit_breaker.rs`（�
 
 ## 7. 改写组件的接入点（本期只定义，不实现任何改写）
 
+> **按用户决定暂缓，本期不实现**（v3.3）：R4 未加入 `intercept.rs`，`Relay::handle` 内没有任何拦截器钩子，core 始终是纯透传；§11 T10 同步暂缓。以下设计内容保留，作为以后迁移改写组件时的参考，不代表当前代码。
+
 core 暴露一个可选的拦截器接口，默认列表为空，即纯透传：
 
 ```rust
@@ -300,10 +302,37 @@ pub struct RelayResponse {
 
 ## 8. 可观测性
 
-- 每个请求输出一行结构化日志：request_id、接口类型、上游 id、尝试次数、状态码、响应头耗时、总耗时、请求与响应字节数。
-- **不记录**请求或响应 body，不记录任何 Key 或 token；日志中的 URL 去掉 query。
+**已实施（R4，`access_log.rs`）**。core 只依赖 `tracing`，不引入 `tracing-subscriber`；订阅者由可执行程序（R5）或宿主安装。
+
+- **每个请求恰好一行**访问日志：`tracing::info!`，target 固定为 `cc_proxy_core::access`（常量 `ACCESS_TARGET`），级别统一为 info，用 `outcome` 字段区分结果，不按级别区分。消息文本固定为 `relay request`。字段：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `request_id` | 进程内 `AtomicU64` 计数器生成，格式 `r-{n:x}`（从 `r-1` 起、十六进制）；**不写入任何响应头**，保持透传 |
+  | `method`、`path` | 入站 method 与 path；**path 不含 query** |
+  | `interface` | §3 识别结果（`claude` / `openai_responses` / `gemini` …），未识别时 `-` |
+  | `upstream` | 最后一次尝试的上游 id，未尝试时 `-` |
+  | `attempts` | 上游尝试次数（含失败的尝试） |
+  | `status` | 发给客户端的状态码，未产生响应（`cancelled`）时 `0` |
+  | `head_ms` | 从收到请求到收到最终上游响应头的耗时；没有上游响应时 `0` |
+  | `total_ms` | 从收到请求到写出这行日志的耗时（流式响应即 body 结束时） |
+  | `request_bytes` | 读入的请求 body 字节数（`413` 等读 body 前失败时 `0`） |
+  | `response_bytes` | 发给客户端的 body 字节数：固定 body 取其长度，流式 body 累计 data 帧字节数 |
+  | `outcome` | 见下表 |
+  | `error` | `outcome = error` 时的错误描述（如空闲超时），否则 `-` |
+
+  | outcome | 语义 | 写出时机 |
+  |---|---|---|
+  | `complete` | 响应完整发出。含中转自身的 401/404/413/502/503、`/_relay/health`、回放的缓冲响应，以及 HEAD / 204 / 304 等无 body 的上游响应 | 固定 body：`AccessLog::finish` 在 `handle` 返回前立即写出；流式 body：`LoggedBody::poll_frame` 读到 `None`，或读到一个 data 帧后内层 `is_end_stream()` 为真（已知长度的 body 在最后一帧之后 hyper 直接 drop body、不会再 poll 出 `None`，`dispatch.rs:382-385`） |
+  | `error` | 响应开始后上游出错或空闲超时（§5.4），客户端连接被中断 | `poll_frame` 读到 `Err`，`error` 字段为其 Display |
+  | `aborted` | 响应开始后客户端断开 | `LoggedBody` 在上述两种情况之前被 drop |
+  | `cancelled` | 响应开始前客户端断开（`handle` future 被 hyper drop，§5.4） | `AccessLog` 的 `Drop`：未写出过就写 `cancelled` |
+
+  `AccessLog` 用一次性标记保证不重复写出；`Relay::handle` 只负责创建 `AccessLog` 并在 `dispatch` 返回后按响应类型选择 `finish` / `stream`，所以每条返回路径都被覆盖。`LoggedBody` 在 `IdleTimeoutBody` 外层，`size_hint` / `is_end_stream` 委托内层，不改变 hyper 的分帧决定。
+- 每次上游尝试失败（网络错误、响应头超时、可重试状态码）和匿名模式下带 `Origin` 的请求各有一行 `tracing::warn!`，**都带同一个 `request_id`**，便于与访问日志关联；这些 warn 不属于访问日志（target 不同），T11 按 target 过滤后计数。
+- **不记录**请求或响应 body，不记录任何 Key 或 token；path 不含 query，warn 里的 `error` 字段是 hyper-util `legacy::Error` 的 Display（`client error (Connect)` 之类，不含 URI，`hyper-util-0.1.20/src/client/legacy/client.rs:1628`）。
 - 不解析 token 用量（解析需要理解响应内容，本期不做；以后可以用只读的旁路观察者实现，同样不改动流）。
-- `GET /_relay/health` 返回 `{"status":"ok"}`（**R4 实现**）。路由顺序：`/_relay/*` 先于鉴权与 §3 的接口匹配（`Relay::handle` 第一步）；`/_relay/` 下未定义的路径 404（`relay_not_found`）；其它路径（含 `/`）按 §3 处理。**R2 阶段 `/_relay/*` 一律 404**。
+- `/_relay/*` 端点（`forward.rs` `relay_endpoint`，**已实施 R4**）：路由顺序是 `/_relay/*` 先于鉴权与 §3 的接口匹配（`Relay::dispatch` 第一步）。`GET` 或 `HEAD /_relay/health` 返回 `200` + `content-type: application/json` + `{"status":"ok"}`，**不需要鉴权**，不暴露任何配置信息（不列上游、不列监听地址、不含版本），从不接触上游；其它方法（如 `POST /_relay/health`）和 `/_relay/` 下的其它路径（`/_relay/`、`/_relay/config`、`/_relay/health/extra`）一律 `404` `relay_not_found`；`/_relay` 之外的路径（含 `/`）按 §3 处理。这些响应同样各写一行访问日志（`interface = -`）。
 
 ## 9. crate 结构与依赖
 
@@ -324,13 +353,19 @@ src-tauri/crates/
 │       ├── upstream.rs      # UpstreamClient enum、UpstreamSet、出站代理连接器
 │       ├── forward.rs       # §5 Relay::handle：转发、故障转移循环、AttemptGuard（R2/R3）
 │       ├── server.rs        # 入站 accept loop（hyper http1 Builder + service_fn，preserve_header_case）
-│       ├── intercept.rs     # §7 拦截器 trait（R4）
+│       ├── access_log.rs    # §8 访问日志：AccessLog、LoggedBody、ACCESS_TARGET（R4）
+│       │                    # （intercept.rs：§7 拦截器，按用户决定暂缓，未加入）
 │       └── error.rs         # 中转自身错误响应（RelayErrorKind、relay_error）
 │   └── tests/
 │       ├── support/mod.rs   # 原始 socket 测试基建：mock 上游、原始客户端、relay 启动
 │       ├── passthrough.rs   # T1–T5、T9（鉴权部分）、T13、URL 拼接、中转错误
 │       ├── outbound_proxy.rs# T14：mock CONNECT / SOCKS5 代理
 │       ├── tls_upstream.rs  # T15：自签 HTTPS 上游 + extra_ca_file
+│       ├── failover.rs      # T6、T8（R3）
+│       ├── timeouts.rs      # 空闲超时（R3）
+│       ├── cancellation.rs  # T7、T12（R3）
+│       ├── relay_endpoints.rs # /_relay/health、T9 启动校验（R4）
+│       ├── access_log.rs    # T11：捕获用 Subscriber + 8 个场景（R4）
 │       └── fixtures/tls/    # 预生成的测试 CA 与 localhost 证书（README.md 记录重新生成方法）
 └── cc-proxy/                # 可执行程序（R5）
     └── src/
@@ -442,7 +477,7 @@ api_key = "${GEMINI_API_KEY}"
 
 ## 11. 测试与验收
 
-透传正确性是本方案的核心，用"上游镜像"集成测试逐项证明。**mock 上游用原始 `TcpListener` + `httparse`**，记录收到的原始字节（头的大小写、顺序、分帧都可见），并按测试用例手写响应字节（含手写 chunked 分帧）；不用 hyper 做 mock 服务端，它会重新解析和分帧。客户端侧同样用原始 socket 发请求、收原始响应字节后自行去分帧再比较。**已实施（R2）**：基建在 `tests/support/mod.rs`（mock 上游按 `Segment` 序列分段写出响应、记录 `RecordedRequest`；原始客户端；`relay_with` 用 `RelayConfig` 启动中转），`passthrough.rs`、`outbound_proxy.rs`（含 mock CONNECT / SOCKS5 代理）、`tls_upstream.rs` 三个文件共 27 个集成测试。**已实施（R3）**：基建增加 mock 上游的 EOF 观察通道（延迟写出期间 `select!` 读 socket，读到 0 / 错误即上报，`closed_within`）；新增 `failover.rs`（T6、T8 共 14 个）、`timeouts.rs`（空闲超时 3 个）、`cancellation.rs`（T7、T12 共 4 个）。配置的超时单位是秒，测试用 1 秒并以 `< 5 s` 的宽松上界断言；T8 的"跳过"与"探测"拆成两个测试，跳过用 60 秒打开期，避免慢机上在断言前进入半开。
+透传正确性是本方案的核心，用"上游镜像"集成测试逐项证明。**mock 上游用原始 `TcpListener` + `httparse`**，记录收到的原始字节（头的大小写、顺序、分帧都可见），并按测试用例手写响应字节（含手写 chunked 分帧）；不用 hyper 做 mock 服务端，它会重新解析和分帧。客户端侧同样用原始 socket 发请求、收原始响应字节后自行去分帧再比较。**已实施（R2）**：基建在 `tests/support/mod.rs`（mock 上游按 `Segment` 序列分段写出响应、记录 `RecordedRequest`；原始客户端；`relay_with` 用 `RelayConfig` 启动中转），`passthrough.rs`、`outbound_proxy.rs`（含 mock CONNECT / SOCKS5 代理）、`tls_upstream.rs` 三个文件共 27 个集成测试。**已实施（R3）**：基建增加 mock 上游的 EOF 观察通道（延迟写出期间 `select!` 读 socket，读到 0 / 错误即上报，`closed_within`）；新增 `failover.rs`（T6、T8 共 14 个）、`timeouts.rs`（空闲超时 3 个）、`cancellation.rs`（T7、T12 共 4 个）。配置的超时单位是秒，测试用 1 秒并以 `< 5 s` 的宽松上界断言；T8 的"跳过"与"探测"拆成两个测试，跳过用 60 秒打开期，避免慢机上在断言前进入半开。**已实施（R4）**：新增 `relay_endpoints.rs`（`/_relay/health` 2 个、T9 启动校验 3 个）与 `access_log.rs`（T11，8 个）。T11 不引入 `tracing-subscriber`（不在锁文件里）：测试文件里自写一个最小 `tracing::Subscriber`（`Capture`），`enabled` 恒真，`event` 用 `field::Visit` 把每个事件的 target 与全部字段收集成字符串（`record_str` / `record_debug`），在 `#[tokio::test]`（current_thread）里用 `tracing::subscriber::set_default` 安装——线程局部即可，因为 `serve`、连接任务与 mock 上游都 `tokio::spawn` 在同一个 `block_on` 线程上，mock 上游用 IP 直连也没有 DNS 的 `spawn_blocking`。访问日志按 `ACCESS_TARGET` 过滤后计数；`aborted` / `cancelled` 由连接任务里的 drop 写出，测试用 `wait_access(n)` 轮询（最长 2 秒）等待，不能在断开后立即断言。
 
 | 编号 | 验收项 |
 |---|---|
@@ -454,9 +489,9 @@ api_key = "${GEMINI_API_KEY}"
 | T6 | 故障转移：首个上游返回 `503` / 连接失败 / 响应头超时时，第二个上游收到的 body 与原请求逐字节相同（头除 `host` 外含大小写与顺序一致）；`400` 不触发切换；最后一个上游返回可重试状态码时直接流式转发（含其 `retry-after`、`x-request-id`）；上游 `429` 之后再遇网络错误时回放缓冲的 `429`（含 `retry-after`）；可重试响应 body 超过 `retry_body_bytes` 且无其它可回放响应时收到 `502`；全部为网络错误时收到 `502`；`max_attempts = 1` 时不切换；`GET /v1/responses/{id}` 遇 `503` 不切换 |
 | T7 | 提交点之后上游中断：上游写出响应头与首个 chunk 后关闭连接，客户端收到 `200` 与首个事件但没有 chunked 结束标记，第二个上游**没有**收到请求 |
 | T8 | 熔断，拆成两个测试：(1) 连续失败达到阈值后跳过该上游（打开期 60 秒，断言期间不会进入半开）；(2) `open_secs`（1 秒）后放行一次探测；另有全部熔断时返回 `503` `relay_no_upstream` 且不接触上游、按上游独立计数（另一接口的成功不影响）。"只放行一个探测"的并发验证在 `breaker.rs` 单元测试（16 线程并发 `try_acquire` 只有一个拿到 `Probe`；`is_available` 不消耗探测名额） |
-| T9 | 入站鉴权：四种携带方式均可通过；同时带正确 `x-api-key` 与错误 `authorization` 通过、反之亦通过；错误 token 返回 `401`；token 不出现在上游请求（头与 query）中；非回环地址且无 token 时拒绝启动；无 token 且未设 `allow_anonymous` 时拒绝启动 |
-| T10 | 未安装拦截器时 T1–T5 成立；安装测试拦截器后其修改（改 path、改 body 且 `content-length` 重算、包装 SSE 流、短路返回）生效；被丢弃的重试响应不触发 `on_response` |
-| T11 | 日志中不出现 body、Key、token、query |
+| T9 | 入站鉴权：四种携带方式均可通过；同时带正确 `x-api-key` 与错误 `authorization` 通过、反之亦通过；错误 token 返回 `401`；token 不出现在上游请求（头与 query）中；**启动校验（已实施 R4，`relay_endpoints.rs`）**：非回环地址且无 token 时 `Relay::new` 拒绝启动（即使设了 `allow_anonymous`，错误同时包含"必须配置 server.auth_tokens"与"只能与回环地址"）；无 token 且未设 `allow_anonymous` 时拒绝启动；配置了 token 后任意地址都可启动 |
+| T10 | **暂缓**（拦截器按用户决定本期不实现，§7）：未安装拦截器时 T1–T5 成立；安装测试拦截器后其修改（改 path、改 body 且 `content-length` 重算、包装 SSE 流、短路返回）生效；被丢弃的重试响应不触发 `on_response` |
+| T11 | **已实施（R4，`access_log.rs`）**。请求带 `?session=QUERY-MARKER` / `?key=QUERY-MARKER`、`x-api-key: <中转 token>`、body 含 `SECRET-BODY-MARKER`，上游响应含 `RESPONSE-BODY-MARKER`；每个用例断言捕获到的**全部**事件（含 warn）的所有字段都不包含中转 token、上游 Key、body 标记、响应 body 标记与 query 标记，并且访问日志恰好一条、字段齐全。8 个场景：(1) 正常 `200`：`method` / `path`（无 query）/ `interface` / `upstream` / `attempts = 1` / `status` / `outcome = complete` / `request_bytes` = 请求 body 长度 / `response_bytes` = 客户端收到的 body 长度，`head_ms` / `total_ms` / `error` 字段存在；(2) 故障转移 `503` → 连接失败 → `200`：一条访问日志（`attempts = 3`、`upstream = b`），两条失败 warn 与它带同一个 `request_id`；(3) 中转自身响应：`401`（`interface = -`，`response_bytes` = 错误 JSON 长度）与 `GET /_relay/health` 各一条 `complete`；(4) 无 body 响应：上游 `204` 记 `complete` 而非 `aborted`；(5) 回放缓冲响应：`429` + 连接失败后回放 `429`，`attempts = 2`、`complete`、`response_bytes` 正确；(6) 响应头到达前客户端断开：`cancelled`、`attempts = 1`；(7) SSE 中途客户端断开：`aborted`、`status = 200`、`response_bytes` = 已发出的 15 字节；(8) SSE 中途空闲超时：`error`，`error` 字段含 `no data` |
 | T12 | 客户端在响应头到达前断开：上游连接被关闭（mock 上游观察到 EOF），第二个上游不被调用；客户端在上传 body 中途断开：上游未收到请求；客户端在流式响应中途断开：上游连接也被关闭（mock 上游观察到 EOF） |
 | T13 | 边界：客户端 chunked 上传 → 上游收到 `content-length` 且 body 相同；客户端带 `expect: 100-continue` → 客户端收到 `100 Continue`、上游未收到 `expect`；`HEAD` 与 `204` 无 body；上游响应 trailer 被丢弃；`GET /v1/models` 不带 `anthropic-version` 透传到 openai_responses 上游、带 `anthropic-version` 透传到 claude 上游；`/v1/models/gemini-2.5-flash:generateContent` 归 gemini、`/v1/models/gpt-4o` 归 openai_responses |
 | T14 | 出站代理：经本地 mock HTTP CONNECT 代理与 mock SOCKS5 代理各转发一次，上游收到的字节与直连相同；`socks5h` 下 mock 代理收到的是域名而非 IP；`http://` 无显式端口的上游经 CONNECT 代理时，mock 代理收到 `CONNECT host:80`（§5.6） |
@@ -474,7 +509,7 @@ api_key = "${GEMINI_API_KEY}"
 | R1 **已实施** | 纯逻辑模块与单元测试：`config`（含校验规则）、`interface`、`headers`（hop-by-hop、凭据移除、原位 host 替换、`expect` 移除）、`upstream_url`（拼接、query 合并、字节级 `key` 过滤、显式端口）、`auth`（候选收集、常量时间比较、匿名规则）、`breaker`、`error`。子步骤与约束见下方"R1 实施须知" | 单元测试覆盖 §2.2 表格每一行、§3 每条规则（含按头分流、`POST` 限定的 Gemini 冒号路径、微调模型 id）、§4 每个例子、§5.5 状态转换、§6 每条规则；T16 中不依赖网络的部分 |
 | R2 **已实施** | `tls`、`upstream`（`UpstreamClient` enum、`UpstreamSet` 按代理设置共享 `Client`、CONNECT/SOCKS 鉴权拼装，§5.6）、`server`（自建 http1 accept loop + `service_fn`，不用 axum，§9）、`forward`（`Relay::handle`：单上游透传，四个接口，流式响应）；接入 R1 的 `auth`；原始 socket 测试基建（`tests/support`）。**验收结果**：T1–T5、T9 鉴权部分、T13、T14、T15 共 27 个集成测试外加若干单元测试全部通过；workspace 全量测试 3200 通过、0 失败、9 忽略。**变异验证**：去掉 `extensions` 搬运后 T2 失败；改成整体缓冲后 T4 失败；对调 `socks5` / `socks5h` 的解析方式后两个 SOCKS 测试都失败。T14 的 CONNECT 用例用带显式端口的上游，`http` 上游缺省端口补 80 由 `upstream_url` 单元测试覆盖。**未实现，留给 R3**：T12 取消测试、故障转移循环、`response_head` / `idle` 超时 | T1–T5、T9（鉴权部分）、T13、T14、T15 |
 | R3 **已实施** | 故障转移循环（`max_attempts`、`has_next` 快照、`last_response` 回放最近一次缓冲、`retry_canceled_requests` 保持 `true`、有状态 Responses 调用限 1 次，§5.2）、每上游熔断器接入（`ResolvedUpstream.breaker`、`AttemptGuard`、`is_available`，§5.5）、`response_head_timeout` 与 `idle_timeout`（`IdleTimeoutBody`，§5.4）、取消语义验证。提交：9b2263ebd、03fbf4fc3、b3318e1c4、05e72d924。**验收结果**：T6、T8 共 14 个测试，空闲超时 3 个，T7、T12 共 4 个，全部通过；workspace 全量 3225 个测试通过、0 失败、9 忽略；core 的测试连续跑 3 次都稳定。**变异验证**：让熔断器始终放行，T8 失败；可重试状态不触发故障转移，T6 失败；关掉空闲超时，stalled 测试失败；把上游请求放进 `spawn`，T12 失败 | T6–T8、T12 |
-| R4 | 日志、`/_relay/health`、`intercept`、T9 中的启动校验 | T9–T11 |
+| R4 **已实施（不含拦截器）** | `/_relay/health`（`GET` / `HEAD`，先于鉴权，不暴露配置，其它 `/_relay/*` 404，§8）、T9 启动校验测试、访问日志（`access_log.rs`：`AccessLog` / `LoggedBody`、`ACCESS_TARGET`、四种 `outcome`、warn 带 `request_id`，§8）、`Relay::handle` 拆成 `handle` + `dispatch` 以覆盖每条返回路径。`intercept` 按用户决定暂缓（§7、T10）。提交：13d8ade11、e5458e0b4。**验收结果**：`relay_endpoints.rs` 5 个、`access_log.rs` 8 个全部通过；workspace 全量 3240 个测试通过、0 失败、9 忽略；core 的测试连续跑 2 次都稳定。**变异验证**：日志 `path` 带上 query 后 T11 失败；"已知长度 body 被误记为 `aborted`"（hyper 在最后一帧后直接 drop body、不再 poll 出 `None`）这个缺陷由 T11 场景 (1) 发现，修正为在 `poll_frame` 里每读完一个 data 帧就检查 `is_end_stream` | T9（启动校验）、T11；T10 暂缓 |
 | R5 | `cc-proxy` 可执行程序：TOML 配置、`${ENV}` 展开、`serve`、`check`（dry-run URL）、示例配置与 `docs/` 使用说明（含 §6.2 匿名风险） | 用本机 mock 上游端到端跑通；真实上游冒烟与 §14 核对由使用者执行 |
 
 **R1 实施须知**（R1 已按此完成，保留作为约束记录）：
@@ -524,6 +559,7 @@ api_key = "${GEMINI_API_KEY}"
 | 版本 | 日期 | 内容 |
 |---|---|---|
 | v1 | 2026-09-29 | 初稿 |
+| v3.3 | 2026-09-29 | 按 R4 实施结果同步（对照 `access_log.rs`、`forward.rs` 与 `tests/{access_log,relay_endpoints}.rs`，提交 13d8ade11、e5458e0b4）：§7 拦截器标"按用户决定暂缓，本期不实现"，设计内容保留作参考；§8 按 `access_log.rs` 重写：字段表、`ACCESS_TARGET`、四种 `outcome`（`complete` / `error` / `aborted` / `cancelled`）的语义与写出时机（含已知长度 body 在最后一帧后被 hyper 直接 drop 的处理）、`request_id` 格式 `r-{n:x}` 且不写入响应头、warn 带 `request_id`、`/_relay/health` 的 `GET` / `HEAD` 免鉴权与其它方法 / 路径 404；§9 目录补 `access_log.rs` 与 R3/R4 测试文件，去掉 `intercept.rs`；§11 记录 T11 的捕获用 Subscriber 与 `set_default` 在 current_thread 下可用的理由，T9 启动校验标"已实施"，T10 标"暂缓"，T11 写入 8 个场景；§12 R4 标"已实施（不含拦截器）"并写入提交、验收结果（workspace 3240 通过 / 0 失败 / 9 忽略，core 连跑 2 次稳定）与两项变异验证 |
 | v3.2 | 2026-09-29 | 按 R3 实施结果同步（对照 `forward.rs`、`idle.rs`、`breaker.rs`、`upstream.rs` 与 `tests/{failover,timeouts,cancellation}.rs`）：§5.2 "全部失败"规则改为回放最近一次完整缓冲的 `last_response`，只有完全没有可回放响应时才 `502`，一次都没尝试（全部熔断）时 `503`；§5.2 补 `max_attempts = min(配置, 上游数)`、有状态 `GET/DELETE /v1/responses/*` 只试 1 次且网络错误也不换上游、最后一次尝试遇可重试状态码直接流式转发但仍记失败、`has_next` 用 `is_available` 快照及其并发等价性、`AttemptGuard` drop 归还许可、`retry_canceled_requests` 保持默认 `true` 的理由；§5.4 `response_head_timeout` / `idle_timeout` 标"已实施"，`IdleTimeoutBody` 同时用于流式回传与缓冲错误 body，错误表更新 `NoUpstream` / `BadGateway` 触发点；§9 目录补 `idle.rs`，dev `tokio` 加 `test-util`；§11 T6/T7/T8/T12 按实际测试改写（T8 拆成跳过与探测两个测试，T12 补流式中途断开），记录新增三个测试文件与 EOF 观察基建；§12 R3 标"已实施"并写入提交、验收结果与变异验证 |
 | v3.1 | 2026-09-29 | 按 R1/R2 实施结果同步（对照 `src-tauri/crates/cc-proxy-core/` 代码与测试）：模块 `url.rs` 改名 `upstream_url.rs`（与外部 crate `url` 重名，§9、§12）；Gemini `/v1/models/{name}:{action}` 仅 `POST` 归 gemini，`GET` 含冒号的 OpenAI 微调模型 id 按 `/v1/models/{id}` 分流（§3）；入站服务改为 hyper `service_fn` 直接调用 `Relay::handle`，不用 axum / tower，路由全在 `interface::identify`（§3、§9）；§5.1 顺序改为鉴权 → 识别接口 → 读 body，R2 单上游版本与错误码落点；中转自身错误 `type` 统一 `relay_` 前缀并列表（§3、§5.4）；`/_relay/*` R2 一律 404、`/_relay/health` R4 实现（§8）；`connect_timeout` 已实施、`response_head` / `idle` 超时与 `retry_canceled_requests` 取舍归 R3（§5.2、§5.4）；§5.6 出站代理各条标"已实施"，显式端口由 `upstream_url` 单测覆盖；§4 `UpstreamConfig` 字段按实际类型（`Secret`、`Option<AuthScheme>`、`Option<String>`）；§9.1 依赖表按 core 实际 `Cargo.toml` 重写（补 `base64`、`percent-encoding`、`http-body`、`cc-switch-domain`，dev 依赖 `httparse`、`tokio-rustls`、`tokio`；删 `axum`、`tower`、`futures-util`、`rustls-pki-types`、`async-trait`，`toml`/`clap`/`tracing-subscriber` 归 R5）；T15 改用 `tests/fixtures/tls/` 预生成证书、不引入 `rcgen`（§11）；§11 记录测试基建与 27 个集成测试；§12 R1、R2 标"已实施"并写入 R2 验收结果（27 集成测试 + workspace 3200 通过 / 0 失败 / 9 忽略）与变异验证 |
 | v3 | 2026-09-29 | 按 Fable 二次审查（源码抽样核对 26 处 + `/tmp/relay-proto` 原型实测）修订：P1 `HeaderCaseMap` 按头名配对拼写，core 重写的 `host` / 鉴权头沿用入站拼写（§2.4、T2、T3）；P2 头顺序定义改为"同名聚合、不同名按首次出现位置"（§2.1、T2）；P3 `default-features = false` 在 workspace 构建中不能避免 provider 二义，唯一保护是 `builder_with_provider` 并禁用 `builder()` 系列，rustls 补 `std`，hyper-rustls 去掉 `webpki-tokio`/`native-tokio`（§9.1、§9.2、§13）；P4 `Tunnel` CONNECT 端口缺省 443，core 按 scheme 补端口（§5.6、T14、R2）；P5 四种连接器为不同 `Client` 类型，用 enum 统一，`with_auth` 签名差异，`connect_timeout` 不覆盖握手（§5.6、R2）；P6 Claude Code 2.1.260 实证会发 `GET /v1/models?limit=1000`，§3 改为按 `anthropic-version` 头分流并写入 `identify(method, path, headers)` 签名（§3、§13、§14 C1、T13）；P7 §6.1 "同时发两个头"改引 Claude Code 自身代码；P8 §2.3 Cargo.toml 行号改为 61-63；P9 `ct_eq` 不等长自行短路（§6.1）；P10 `on_response` 在提交点之前（§7）；P11 hyper-util `retry_canceled_requests` 内部重试与 body drop 排空行为（§5.2、R3）；P12 axum 单 `fallback` 路由（§3、§9、R2）；P13 Codex 0.155.1 对 `/models` 404 的行为与 `previous_response_id` 字符串证据（§14 C2、C3）；R1 实施须知并入 §12，R1 只引入纯逻辑依赖，`auth` 接入提前到 R2（§12）；取消语义、流式、100-continue、chunked→content-length 原型实测结论记入 §2.4、§5.4、§9 |
