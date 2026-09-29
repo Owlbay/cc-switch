@@ -1,6 +1,7 @@
 # 协议转换组件设计方案
 
-> 状态：草案 v3（已按 Fable 二次审查修订）· 基线：`refactor/standalone-proxy-core@885140d9e`
+> 状态：v3.1（已按 C2 实现同步）· 基线：`refactor/standalone-proxy-core@ddece34bf`
+> 与实现的偏离点集中记录在 §13 的 v3.1 条目，各章节中以"**实现（C2）**"标注。
 > 关联：[passthrough-relay-design-zh.md](passthrough-relay-design-zh.md)（透传 core，本文实现其 §7 预留的改写组件中的"协议转换"一类）
 >
 > 文中 `文件:行号` 均指本仓库 `src-tauri/src/proxy/providers/` 下桌面端现有转换代码（协议细节的对照），或 `src-tauri/crates/cc-proxy-core/src/` 下的透传 core。
@@ -99,13 +100,14 @@ model_map = { "claude-sonnet-5" = "claude-sonnet-4-5" }
 | `protocol` | `model_map` | 路径 |
 |---|---|---|
 | 缺省或等于接口 | 空 | **透传**：逐字节不变（现状） |
-| 缺省或等于接口 | 非空 | **恒等转换**：请求解析为 IR、改模型名、再生成同协议请求；响应也经过 IR 重新生成。**不再逐字节透传**：IR 未建模的字段（如 `cache_control` 之外的厂商扩展、未知顶层字段）会丢失，`metadata`、`anthropic-beta` 等按 §5 处理。文档与 `check` 输出都要把这一点讲清楚，用户只有在接受这种代价时才应配置同协议 `model_map` |
+| 缺省或等于接口 | 非空 | **恒等转换**：只改模型名。**实现（C2）不经 IR 重建**，而是在原始 JSON 上只重写 `model` 字段：请求 body 解析为 JSON 后替换 `model`（body 为空时原样；不是 JSON 时返回 `Unsupported` 跳过该上游），path、query 与请求头原样保留（只删 `content-length`）；响应流式时只改 `message_start` 里的 `message.model`，非流式只改顶层 `model`（非 2xx 的 body 原样）。因此 `cache_control`、`thinking: {type: adaptive}`、`output_config`、未知顶层字段等全部原样到达上游。代价只剩两点：body 经 JSON 反序列化 / 序列化（键序保持，空白与数字字面量可能规范化），流式响应经 SSE 解析后重新成帧（§6.1） |
 | 不等于接口 | 任意 | **协议转换** |
 
 - `protocol` 取值同接口名：`claude`、`openai_chat`、`openai_responses`、`gemini`。
 - `model_map` 匹配顺序：精确匹配 → `*`；都不匹配时保留原模型名。键与值都不能为空字符串。
 - `auth` 缺省值按**上游协议**取（`openai_chat` 上游默认 Bearer，`gemini` 上游默认 `x-goog-api-key`），而不是按所在接口。core 现状是按接口取（`upstream.rs:250` 的 `auth: upstream.auth_scheme(interface)`，`config.rs:57-63` 的 `AuthScheme::default_for`），**C1 需改为按上游协议取**；显式设置 `auth` 时不变。`protocol` 缺省等于接口时行为与现状完全一致。
-- `default_max_output_tokens`：客户端请求没有输出上限时（Codex CLI 不发 `max_output_tokens`）写入上游请求的值，缺省 16384。它决定 Anthropic 的 `max_tokens`，进而决定 thinking 预算的钳位上限（§5.2 第 1 条）；`check` 输出每个转换上游的该值。透传路径不使用。
+- `default_max_output_tokens`：客户端请求没有输出上限时（Codex CLI 不发 `max_output_tokens`）写入上游请求的值，缺省 16384。它决定 Anthropic 的 `max_tokens`，进而决定 thinking 预算的钳位上限（§5.2 第 1 条）；`check` 对跨协议上游输出该值。透传路径不使用。
+- **实现（C2）的 `check` 输出**：对转换上游按**上游协议**的样例端点做 dry-run（`claude→openai_chat` 的上游显示 `.../v1/chat/completions`），并在该行末尾追加 `convert=<client>-><upstream>`；跨协议上游再追加 ` default_max_output_tokens=<N>`（如 `convert=claude->openai_chat default_max_output_tokens=8192`），恒等转换只显示 `convert=claude->claude`（不用该值）。示例配置 `crates/cc-proxy/config.example.toml` 含一个 `claude→openai_chat` 上游示例（`id = "deepseek-for-claude"`，`model_map = { "*" = "deepseek-chat" }`，`default_max_output_tokens = 8192`）。
 - 同一接口的上游列表可以混合透传与转换，故障转移按顺序进行（§8.3）。
 
 ### 3.2 校验
@@ -224,13 +226,13 @@ pub enum Event {
 
 | IR | Anthropic Messages | OpenAI Chat | OpenAI Responses | Gemini |
 |---|---|---|---|---|
-| `system` | `system`（字符串或 text 块数组，`cache_control` 丢弃） | 首条 `role: system`（解析时 `developer` 同） | `instructions`；解析时 `input[]` 里 `role: system / developer` 的 message 项也并入（`transform_codex_anthropic.rs:247-263`） | `systemInstruction.parts` |
+| `system` | `system`（字符串或 text 块数组，`cache_control` 丢弃） | 首条 `role: system`（多个 text 块以 `\n` 拼接；解析时 `developer` 同）。**实现（C2）**：发往 Chat 上游时剥离第一个 system 块开头的 `x-anthropic-billing-header:` 行（含其后的一个空行；该行的值每次请求都变，会破坏上游前缀缓存）；只处理开头，写在别处的同名文本保留；剥离后为空的块不输出 | `instructions`；解析时 `input[]` 里 `role: system / developer` 的 message 项也并入（`transform_codex_anthropic.rs:247-263`） | `systemInstruction.parts` |
 | `messages` | `messages[].content` 块 | `messages[]`（content 字符串或 parts；`role: tool` 为工具结果） | `input[]` 项，见 §5.2 | `contents[]`（role `user` / `model`；`functionResponse` 放在 `user` 轮） |
 | `tools` | `tools[]{name, description, input_schema}` | `tools[]{type:function, function{name, description, parameters}}` | `tools[]{type:function, name, description, parameters}` | `tools[].functionDeclarations[]`，schema 处理见 §5.2 |
 | `tool_choice` | `auto` / `any` / `none` / `{type:tool,name}`；`disable_parallel_tool_use` → `parallel_tool_calls` | `auto` / `required` / `none` / `{type:function,function:{name}}` | `auto` / `required` / `none` / `{type:function,name}` | `toolConfig.functionCallingConfig.mode`（`AUTO` / `ANY` / `NONE`）+ `allowedFunctionNames` |
 | `max_output_tokens` | `max_tokens`（**必填**；客户端未带时取上游 `default_max_output_tokens`，§3.1） | `max_tokens`（现有代码只对 o 系模型用 `max_completion_tokens`，`transform.rs:214-221`；大量兼容网关不识别后者，本期固定 `max_tokens`，方言选项见 §1.2） | `max_output_tokens`（**≥ 16**，小于 16 的正整数钳到 16；Claude 桌面端探测请求用 `max_tokens: 1`，`transform_responses.rs:1813-1826`） | `generationConfig.maxOutputTokens` |
 | `temperature` / `top_p` / `top_k` / `stop` | 同名，`stop_sequences` | 同名（无 `top_k`），`stop` | 同名（无 `top_k` / `stop`，丢弃并记 debug） | `generationConfig.temperature / topP / topK / stopSequences` |
-| `reasoning` | `thinking{type:enabled, budget_tokens}` / `{type:disabled}` / `{type:adaptive}` + `output_config{effort}`（Claude Code 对 4.6 系模型的默认形态，`transform_codex_anthropic.rs:301-341`） | `reasoning_effort` | `reasoning{effort}` | `generationConfig.thinkingConfig{thinkingBudget}`（`0` 表示关闭；Gemini 2.5 Pro 不接受 `0`，最小 128，`Disabled` 对它会被上游 400，写入使用说明） |
+| `reasoning` | `thinking{type:enabled, budget_tokens}` / `{type:disabled}` / `{type:adaptive}` + `output_config{effort}`（Claude Code 对 4.6 系模型的默认形态，`transform_codex_anthropic.rs:301-341`） | `reasoning_effort`。**实现（C2）只对支持的模型族下发**（按映射后的上游模型名判断，不区分大小写）：o 系列（`o` + 数字开头）、`gpt-5` 及以上（`gpt-` 后首字符为 ≥ 5 的数字）、`grok-4.5` 及以上（`grok-4.<minor>`，minor ≥ 5）、`grok-build-*`；其他模型不写该字段（严格的兼容网关会整请求拒绝未知字段）。`Disabled` / `Unspecified` 不写 | `reasoning{effort}` | `generationConfig.thinkingConfig{thinkingBudget}`（`0` 表示关闭；Gemini 2.5 Pro 不接受 `0`，最小 128，`Disabled` 对它会被上游 400，写入使用说明） |
 | `stream` | `stream` | `stream` + `stream_options.include_usage=true`（否则多数上游流式不回 usage，`transform.rs:276-300`） | `stream` | path `:streamGenerateContent?alt=sse` vs `:generateContent` |
 | 无状态化 | — | — | 生成时**固定写** `store: false`，并保证 `include` 含 `reasoning.encrypted_content`（`transform_responses.rs:2003-2027`）：否则上游不返回 `encrypted_content`，§5.5 的封套永远为空、多轮 thinking 退化，且 OpenAI 默认会保存响应 | — |
 | `user` | `metadata.user_id` | `user` | `user` | — |
@@ -246,7 +248,7 @@ reasoning 换算（对照 `transform_codex_anthropic.rs:36-46`，官方要求 An
 | `xhigh` | 24576 | 24576 |
 | `Disabled`（Chat / Responses 的 `none`） | `thinking: {type: disabled}` | `thinkingBudget: 0` |
 
-budget → effort 取最接近档；目标协议不认识的档位（如给 Chat 上游 `xhigh`）降到 `high`。解析 Chat / Responses 时 `max` / `ultra` 视为 `xhigh`（`transform_codex_anthropic.rs:36-46`）。
+budget → effort 取最接近档（候选 `low` / `medium` / `high` / `xhigh`；`minimal` 不作为反推结果）。解析 Chat / Responses 时 `max` / `ultra` 视为 `xhigh`（`transform_codex_anthropic.rs:36-46`）。**实现（C2）**：给 Chat 上游时 `xhigh` **原样下发**，不降到 `high`（与桌面端一致；`gpt-5.x` 系接受该档，o 系列老模型可能拒绝，作为已知限制）。`thinking: {type: enabled}` 无 `budget_tokens` 时按 `Effort(output_config.effort)`，`effort` 缺省 `high`。
 
 `Adaptive(effort)` 的换算：
 
@@ -257,7 +259,7 @@ budget → effort 取最接近档；目标协议不认识的档位（如给 Chat
 
 ### 5.2 各协议的结构细节
 
-**Anthropic 请求生成的合法性规范化**（不做会被 Anthropic 400，规则来自 `transform_codex_anthropic.rs`）：
+**Anthropic 请求生成的合法性规范化**（不做会被 Anthropic 400，规则来自 `transform_codex_anthropic.rs`；**实现（C2）**：Anthropic 上游侧的请求生成、响应与流式解析推迟到 C3，C2 只有 Anthropic 客户端侧编解码（请求解析、响应与流式编码、错误格式）与 Chat 上游侧编解码，下列规范化随 C3 实现）：
 
 1. `budget_tokens < max_tokens`：预算钳到 `max_tokens / 2`，钳后 `< 1024` 则改为不开 thinking（`:346-360`）。不抬高调用方的 `max_tokens`；调用方没带时用上游 `default_max_output_tokens`（缺省 16384，使 `high` 的 16384 预算钳到 8192 而不是 4096 下的 2048）。
 2. thinking 开启时不发 `temperature` / `top_p` / `top_k`（`:369-376`）。
@@ -387,13 +389,14 @@ stop reason（对照 `transform.rs:650-660`、`transform_gemini.rs:1241-1263`、
 
 - 解析器按 SSE 规范处理：`\n` / `\r\n` / `\r` 行结束，`event:`、`data:`（多行拼接）、`id:`、`retry:`，以 `:` 开头的注释行，空行分隔事件；跨网络分片的半行保留到下一块；UTF-8 多字节序列被切开时保留到下一块再解码。
 - 只有进入转换路径的响应才经过解析器；透传路径不解析（保持逐字节透传）。
+- **实现（C2）**：解析器整行解码（行结束符都是 ASCII，不会落在多字节序列中间），`id:` / `retry:` / 未知字段与 `:` 开头的注释行不产生事件；流结束时没有以空行收尾的最后一个事件也交出。恒等转换的流式响应同样经过解析与重新成帧（`event: <name>\ndata: <json>\n\n`，多行 data 以 `\n` 拼接），因此上游的注释行、`id` / `retry` 字段与 CRLF 行尾不会原样到达客户端。
 
 ### 6.2 各协议解码
 
 | 源协议 | 流的形态 | 规范化要点 |
 |---|---|---|
 | Anthropic | `message_start` / `content_block_*` / `message_delta` / `message_stop` / `ping` / `error` | 已有块边界；`ping` 丢弃；`signature_delta` → `SignatureDelta`；`redacted_thinking` 的 `content_block_start.data` → `RedactedThinking` 块；`message_delta.usage` 与 `message_start.usage` 合并为 `Finish.usage` |
-| OpenAI Chat | `data: {chunk}`，以 `data: [DONE]` 结束 | 由 `delta.content` / `delta.reasoning_content`（或 `delta.reasoning`）/ `delta.tool_calls[i]` 推断块开始与切换；**`reasoning_content: ""` 不开块**（`streaming.rs:269-275`）；tool_calls 按 `index` 归属，**`arguments` 可能先于 `id` / `name` 到达**，块在拿到 name 前先缓冲（`streaming.rs:170-171`、测试 `:883-890`）；`finish_reason` **不立即产生 `Finish`**：usage chunk 通常在 finish_reason 之后、`choices: []`，且部分上游重复发 finish_reason（`streaming.rs:160-165`、测试 `:997-1060`），故 `Finish` 在 `[DONE]` 或流结束时发出并合并最后的 usage；没有 `[DONE]` 而流正常结束也发 `Finish`；既无 finish_reason 也无 `[DONE]` 就结束 → `Error` |
+| OpenAI Chat | `data: {chunk}`，以 `data: [DONE]` 结束 | 由 `delta.content` / `delta.reasoning_content`（或 `delta.reasoning`）/ `delta.tool_calls[i]` 推断块开始与切换；**`reasoning_content: ""` 不开块**（`streaming.rs:269-275`）；tool_calls 按 `index` 归属，**`arguments` 可能先于 `id` / `name` 到达**，块在拿到 name 前先缓冲（`streaming.rs:170-171`、测试 `:883-890`）；`finish_reason` **不立即产生 `Finish`**：usage chunk 通常在 finish_reason 之后、`choices: []`，且部分上游重复发 finish_reason（`streaming.rs:160-165`、测试 `:997-1060`），故 `Finish` 在 `[DONE]` 或流结束时发出并合并最后的 usage；没有 `[DONE]` 而流正常结束也发 `Finish`；既无 finish_reason 也无 `[DONE]` 就结束 → `Error`。**实现（C2）**：一个工具块正在输出时，其他 `index` 的工具调用只缓冲（id / name / 参数都累积），不开块也不关当前块；流结束（`finalize`）时按首次出现的顺序整体输出（`BlockStart` → 一条 `ToolArgumentsDelta` → `BlockStop`）。兼容网关交错发送多个工具参数时不丢数据，代价是后续工具的参数不再逐字节流式 |
 | OpenAI Responses | `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.function_call_arguments.delta` / `response.reasoning_summary_text.delta` / `response.reasoning_text.delta`（原文推理，与 summary 同样进 `ThinkingDelta`） / `response.custom_tool_call_input.delta` / `response.output_item.done` / `response.completed` / `response.incomplete` / `response.failed` / `error`；`content_part.*`、`*.done`、`reasoning_summary_part.*` 只用于校验、不产生事件 | 以 output item 为块；`output_item.done` 的 `reasoning` 项带 `encrypted_content` → `SignatureDelta`；`function_call` 的 `output_item.done` 带完整 `arguments`，与已收到的 delta 不一致时以 done 为准；`response.completed` / `response.incomplete` → `Finish`；`response.failed` / `error` → `Error` |
 | Gemini | 每个 `data:` 是一个 `GenerateContentResponse` 片段 | 按 part 类型推断块；文本 part 可能是**增量**也可能是**累计快照**（部分网关），用"新文本以已累计文本为前缀"判定并只发增量（`streaming_gemini.rs:356-364`）；`functionCall` 一次给出完整参数（一条 `ToolArgumentsDelta`），同一调用可能在后续片段重复出现（按 id 或位置去重，`streaming_gemini.rs:100-135`）；`thoughtSignature` 可能只出现在某个片段（`streaming_gemini.rs:170-180`）；最后一个带 `finishReason` 的片段 → `Finish`（stop reason 规则同 §5.6：`STOP` + functionCall ⇒ `ToolUse`）；`promptFeedback.blockReason` → `Refusal` |
 
@@ -411,7 +414,8 @@ stop reason（对照 `transform.rs:650-660`、`transform_gemini.rs:1241-1263`、
 
 ### 6.4 异常流
 
-- 上游流在 `Finish` 之前结束：编码器补发目标协议的错误事件（Anthropic `error`、Responses `response.failed`），并以错误结束 body，使客户端连接中断（与透传 core 的提交点语义一致）。
+- 上游流在 `Finish` 之前结束：编码器补发目标协议的错误事件（Anthropic `error`、Responses `response.failed`），并以错误结束 body，使客户端连接中断（与透传 core 的提交点语义一致）。**实现（C2）**：只有内层 body 出错（上游断连、空闲超时、`feed` 返回 `Err`）时 body 以错误结束；上游流**正常**结束但既无 `finish_reason` 也无 `[DONE]` 时，补发 `error` 事件后 body 正常结束（不中断连接）。恒等转换在内层出错时也补发 Anthropic `error` 事件。
+- **实现（C2）流式请求收到 JSON 响应**（上游忽略 `stream`，或端点本来就不流式）：`convert_head` 看到 2xx 且 `content-type` 含 `json` 时切换为缓冲模式（上限 64 MiB，超出为 `ConvertError::Response`，按 `feed` 出错处理）。Chat→Anthropic：body 收完后按非流式解析为 `ir::Response`，再经 `ir::response_events` 展开为规范化事件交给编码器，客户端仍收到 `text/event-stream` 的完整 Anthropic 事件序列；内层出错则只补发 `error` 事件。恒等转换：收完后按非流式只改顶层 `model`，响应头保留上游的 `content-type`（客户端收到 JSON）；内层出错时把已收到的部分原样交出。
 - 上游 `Error` 事件：编码为目标协议的错误事件。
 - 空闲超时、访问日志沿用 core 现有包装，包装顺序与 `ConvertingBody` 的要求见 §8.4。
 
@@ -419,7 +423,8 @@ stop reason（对照 `transform.rs:650-660`、`transform_gemini.rs:1241-1263`、
 
 - 上游 2xx：读完整 body（受 `idle_timeout` 约束，且以 `server.max_body_bytes` 封顶，超出返回 502 `relay_conversion_error`）解析为 `ir::Response`，生成客户端协议 JSON；`content-type: application/json`，`content-length` 由新 body 决定。
 - 上游非 2xx（**含不可重试的状态码**）：先以 `failover.retry_body_bytes` 有界缓冲 body（超出 → 502 `relay_conversion_error`），状态码保持，body 尽力解析为错误（`{error:{type,message}}` / Gemini `{error:{code,status,message}}`），按客户端协议格式重写（Anthropic `{type:"error", error:{type, message}}`；Responses `{error:{type, message, code}}`）；解析失败时把原始 body 作为 message 文本包装。转换上游的非 2xx 响应**不走流式透传**（§8.3）。
-- `retry-after` 等语义头保留；上游的 `content-length`、`content-type`、`content-encoding` 与协议专有头（`anthropic-*`、`openai-*`、`x-goog-*`）不转发给客户端，由转换结果重新生成。
+- `retry-after` 等语义头保留；上游的 `content-length`、`content-type`、`content-encoding` 与协议专有头（`anthropic-*`、`openai-*`、`x-goog-*`）不转发给客户端，由转换结果重新生成。**实现（C2）**：`content-length` / `content-encoding` 由 core 统一删除；Chat→Anthropic 删 `openai-*` 并按"流式且 2xx"写 `text/event-stream`、否则 `application/json`；恒等转换的响应头原样（只经 core 的删除）。
+- **实现（C2）**：转换路径上游返回压缩响应（`content-encoding` 非 `identity`）时，无论流式还是非流式、无论状态码，都直接返回 502 `relay_conversion_error`，**不计入熔断**（尝试许可归还，不记成功也不记失败）：转换请求已删除 `accept-encoding`，上游仍压缩属于上游配置问题而非健康问题。
 
 ## 8. 与 core 的集成
 
@@ -447,7 +452,8 @@ pub struct ConversionContext<'a> {
 
 pub struct InboundRequest<'a> { pub method: &'a Method, pub path: &'a str, pub query: Option<&'a str>, pub headers: &'a HeaderMap, pub body: &'a Bytes }
 
-pub struct OutboundRequest { pub method: Method, pub path_and_query: String, pub headers: HeaderMap, pub body: Bytes, pub meta: OutboundMeta }
+// 实现：path 与 query 分开（core 按 base_url / strip_prefix 拼 path，再附 query）
+pub struct OutboundRequest { pub method: Method, pub path: String, pub query: Option<String>, pub headers: HeaderMap, pub body: Bytes, pub meta: OutboundMeta }
 
 /// 响应转换需要的请求侧信息（由 convert_request 填好）
 pub struct OutboundMeta {
@@ -459,12 +465,13 @@ pub struct OutboundMeta {
     pub hosted_web_search: Option<String>, // 请求中被映射的 server tool 名，响应映射回去时用
 }
 
-pub trait ResponseConverter: Send {
+/// 实现要求 `Send + Sync`：响应 body 统一为可跨线程共享的 `BoxBody`，转换器状态被单个 body 独占访问
+pub trait ResponseConverter: Send + Sync {
     fn convert_head(&mut self, status: StatusCode, headers: &HeaderMap) -> HeaderMap;
     /// 流式：喂入上游 body 字节，返回要发给客户端的字节（可为空）
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, ConvertError>;
     /// 上游 body 结束（含错误结束：`error` 为 Some 时补发错误帧）
-    fn finish(&mut self, error: Option<&dyn std::error::Error>) -> Vec<Bytes>;
+    fn finish(&mut self, error: Option<&(dyn std::error::Error + 'static)>) -> Vec<Bytes>;
     /// 非流式：整段上游 body → 整段客户端 body
     fn convert_full(&mut self, status: StatusCode, body: &[u8]) -> Result<Bytes, ConvertError>;
 }
@@ -484,10 +491,10 @@ pub enum ConvertError {
 
 ### 8.2 请求
 
-- 转换请求的头：以入站头为基础，按透传规则（hop-by-hop、`expect`、入站凭据）处理后，再由转换器调整：删除 `accept-encoding`（上游必须返回未压缩内容，否则无法解析）、`content-length`（重算）与源协议专有头（`anthropic-version`、`anthropic-beta`、`x-stainless-*`、`openai-*`、`x-goog-*` 中不属于目标协议的）；补充目标协议必需头（目标为 Anthropic 时缺省 `anthropic-version: 2023-06-01`；目标为 Gemini 且流式时 `accept: text/event-stream` 可选）。上游鉴权按上游协议写入（§3.1）。
+- 转换请求的头：以入站头为基础，按透传规则（hop-by-hop、`expect`、入站凭据）处理后，再由转换器调整：删除 `accept-encoding`（上游必须返回未压缩内容，否则无法解析）、`content-length`（重算）与源协议专有头（`anthropic-version`、`anthropic-beta`、`x-stainless-*`、`openai-*`、`x-goog-*` 中不属于目标协议的）；补充目标协议必需头（目标为 Anthropic 时缺省 `anthropic-version: 2023-06-01`；目标为 Gemini 且流式时 `accept: text/event-stream` 可选）。上游鉴权按上游协议写入（§3.1）。**实现（C2）**：转换器先于 core 处理头（顺序与上文相反，结果等价）：`claude→openai_chat` 删 `anthropic-*`、`x-stainless-*` 前缀头与 `content-length`，改写 `content-type: application/json`，query 丢弃；其余头（`user-agent` 等）原样保留；core 在 `build_converted_request` 中兜底删除 `accept-encoding` 与 `content-length`，再按透传边界处理。恒等转换的头与 query 原样。
 - `preserve_header_case`：入站 `extensions` 里的 `HeaderCaseMap` 只覆盖从入站复制的头；转换器新增或改写的头不在其中，按小写发出。恒等转换与协议转换都如此，文档与 `check` 输出注明。
 - path：由转换器按目标协议生成（Chat `/v1/chat/completions`、Responses `/v1/responses`、Anthropic `/v1/messages`、Gemini `/v1beta/models/{upstream_model}:{generateContent|streamGenerateContent}?alt=sse`），再经 core 的 `base_url` / `strip_prefix` 拼接。
-- 同一请求中，转换结果在尝试间按 **`(上游协议, model_map 映射结果)`** 复用；只按协议复用会让不同 `model_map` 的上游拿到错误的模型名。
+- 同一请求中，转换结果在尝试间复用；只按协议复用会让不同 `model_map` 的上游拿到错误的模型名。**实现（C2）**：缓存键为 **`(上游协议, 整个 model_map)`**（按值比较映射表本身而不是映射结果），跨故障转移尝试复用同一份 `OutboundRequest`（含 `meta`）；映射表不同的上游各自转换一次。缓存只在单个请求的尝试循环内存活。
 
 ### 8.3 故障转移
 
@@ -495,6 +502,7 @@ pub enum ConvertError {
 - `convert_request` 返回 `Unsupported`：记 warn、**释放该上游的熔断许可（`AttemptGuard` drop，不计成功也不计失败）、继续下一个上游**（同接口可混合透传上游，它们可能能服务这个请求）。`Unsupported` **不计入 `attempts`、不调用 `log.start_attempt`**：现状在构造请求前就 `attempts += 1`（`forward.rs:161`），`max_attempts = 1` 时跳过后将无法转到透传上游，故转换调用要移到计数之前。全部上游都跳过或失败且没有可回放的响应时，返回 400 `relay_conversion_unsupported`，message 取第一个 `Unsupported` 的原因；有其他失败时按现有优先级（回放 > 502 > 503）。
 - `convert_request` 返回 `Internal`：立即 500 `relay_conversion_error`。
 - 转换上游的非 2xx 响应（无论是否可重试，包括现状直接 `relay_response` 的两处：不可重试状态 `forward.rs:217-221`、"最后一次尝试"`:238-241`）一律经 `buffer_response` 有界缓冲，**缓冲时即调用 `convert_full` 重写为客户端协议**，结果直接放入 `LastFailure.response`（可重试）或直接返回（不可重试）。这样 `LastFailure` 无需记录上游协议，回放逻辑不变；缓冲超限按现状记 `last.error`。
+- **实现（C2）的访问日志**：`start_attempt` 每次尝试都覆盖 `upstream` 与 `convert` 字段，因此回放 `LastFailure` 时这两个字段取**最后一次尝试**的值（不一定是被回放响应所属的上游；`attempts` 为实际尝试次数，被 `Unsupported` 跳过的上游不计）。
 
 ### 8.4 响应体
 
@@ -502,7 +510,7 @@ pub enum ConvertError {
 - `ConvertingBody` 的 `size_hint()` 返回 `SizeHint::default()`（不能转发内层的 `content-length`，输出长度已变）；`is_end_stream()` 恒返回 false，直到自身输出缓冲排空且内层已返回 `None`：`LoggedBody` 读到最后一帧后用 `inner.is_end_stream()` 判定结束（`access_log.rs:189-195`），hyper 也据此决定是否继续 poll；`finish()` 补发的帧否则会丢。内层的 trailers 帧丢弃。
 - 内层错误（空闲超时、上游断连）与 `feed` 返回 `Err`（流不可解析）：`ConvertingBody` 先把 `finish(Some(err))` 产生的错误帧作为数据帧发出，再返回 `Err`，与 §6.4 一致；`LoggedBody` 随之记 `outcome = error`。
 - 转换响应的头：删除上游 `content-length`、`content-encoding`，`content-type` 由转换器重写（§7）。
-- 上游响应带 `content-encoding`（非 identity）时判定为转换失败：非流式返回 502 `relay_conversion_error`，流式按 §6.4 结束。
+- 上游响应带 `content-encoding`（非 identity）时判定为转换失败。**实现（C2）**：在拿到响应头后、区分流式 / 非流式之前就判定，流式与非流式一律返回 502 `relay_conversion_error`（不进入 §6.4），不计入熔断（§7）。
 - 访问日志新增字段 `convert`（如 `claude->openai_chat`、恒等转换 `claude->claude`，透传时为 `-`）；其余字段（`attempts`、`upstream`、`status`）语义不变。
 - `preserve_header_case`：转换请求仍附带入站 `Extensions`（含 `HeaderCaseMap`）；hyper 写头时对不在映射中的名字回退为小写，转换器新增或改写的头因此按小写发出，无需额外处理；响应侧同理。
 
@@ -511,7 +519,7 @@ pub enum ConvertError {
 | 端点 | 处理 |
 |---|---|
 | `POST /v1/messages/count_tokens` → 非 Anthropic 上游 | `Unsupported`（按 §8.3 跳到下一个上游；没有可用上游则 400） |
-| `GET /v1/models`、`GET /v1/models/{id}` | 本期不做列表格式转换（§1.2）。转换上游收到这类请求时返回 `Unsupported`（跳过），让同接口的透传上游服务；同协议恒等转换上游按透传处理 |
+| `GET /v1/models`、`GET /v1/models/{id}` | 本期不做列表格式转换（§1.2）。转换上游收到这类请求时返回 `Unsupported`（跳过），让同接口的透传上游服务；同协议恒等转换上游按透传处理。**实现（C2）**：`claude→openai_chat` 只接受 `POST /v1/messages`，其他方法 / 路径一律 `Unsupported`；恒等转换对任何端点都放行：body 为空原样、body 为 JSON 且含 `model` 则只改 `model`（`count_tokens` 也会被映射）、body 不是 JSON 则 `Unsupported` |
 | `GET/DELETE /v1/responses/{id}`、`POST /v1/responses/compact` → 非 Responses 上游 | `Unsupported` |
 | Gemini `:countTokens`、`:embedContent`、`:batchEmbedContents` | Gemini 不是本期客户端协议，不涉及 |
 
@@ -541,8 +549,8 @@ pub enum ConvertError {
 | 步骤 | 内容 | 估计 | 验收 |
 |---|---|---|---|
 | C1 | core 集成，子步骤见下 | ~0.9k 行 | X7（恒等版）、X8、X12 的 `ConvertingBody` 项、X13 的透传项 |
-| C2 | `cc-proxy-convert` crate 基础：IR 类型、SSE 解析器、签名封套（仅 `ccsw1`）、model_map、Anthropic Messages 编解码（请求解析 / 生成、响应生成 / 解析、流式解码 / 编码，含 §5.2 规范化与 adaptive thinking）、OpenAI Chat 上游侧编解码（请求生成、响应与流式解析）、错误响应转换；**`cc-proxy` 在本步注入转换器**（`Relay::with_converter`），示例配置加一个 `claude→openai_chat` 上游，便于用真实 Claude Code 端到端验证。方向：`claude→claude`（恒等）、`claude→openai_chat` | ~3.5k 行 | X1–X3（两种协议）、X5（两个方向）、X6 的 Claude 部分、X10、X12 的 Chat 项、X13，真实客户端手动验证 |
-| C3 | OpenAI Responses 编解码（客户端侧请求解析与响应 / 流式编码含 §6.3 完整事件清单与 custom 工具还原，上游侧请求生成含 `store: false` / `include` 与响应 / 流式解码）、Responses ↔ Anthropic 的签名封套、server tool ↔ `web_search` 映射。方向：`openai_responses→openai_responses`（恒等）、`openai_responses→claude`、`openai_responses→openai_chat`、`claude→openai_responses` | ~4k 行以上（现有对应代码含测试约 15k 行，IR 化后仍是最大的一步） | X1–X3、X5（四个方向）、X6 的 Codex 部分、X11（Anthropic / Responses 互回放）、X14（Anthropic / Chat） |
+| C2（已完成） | `cc-proxy-convert` crate 基础：IR 类型、SSE 解析器、签名封套（仅 `ccsw1`）、model_map、**Anthropic Messages 客户端侧**编解码（请求解析、响应生成、流式编码、错误格式）、OpenAI Chat 上游侧编解码（请求生成、响应与流式解析）、错误响应转换；**`cc-proxy` 在本步注入转换器**（`Relay::with_converter`），示例配置加一个 `claude→openai_chat` 上游（`deepseek-for-claude`），便于用真实 Claude Code 端到端验证。方向：`claude→claude`（恒等，**不经 IR，只改 `model`**，§3.1）、`claude→openai_chat`。**推迟到 C3**：Anthropic 上游侧（请求生成含 §5.2 规范化与 adaptive thinking 回放、响应与流式解析） | ~3.5k 行 | X1–X3（Anthropic 客户端侧、Chat 上游侧）、X5（两个方向）、X6 的 Claude 部分、X12 的 Chat 项、X13；X10 随 Anthropic 上游侧移到 C3；真实客户端手动验证 |
+| C3 | OpenAI Responses 编解码（客户端侧请求解析与响应 / 流式编码含 §6.3 完整事件清单与 custom 工具还原，上游侧请求生成含 `store: false` / `include` 与响应 / 流式解码）、**Anthropic 上游侧编解码（自 C2 推迟）**、Responses ↔ Anthropic 的签名封套、server tool ↔ `web_search` 映射。方向：`openai_responses→openai_responses`（恒等）、`openai_responses→claude`、`openai_responses→openai_chat`、`claude→openai_responses` | ~4k 行以上（现有对应代码含测试约 15k 行，IR 化后仍是最大的一步） | X1–X3、X5（四个方向）、X6 的 Codex 部分、X10、X11（Anthropic / Responses 互回放）、X14（Anthropic / Chat） |
 | C4 | Gemini 上游侧编解码（请求生成含 path 中的模型与流式标志、schema 子集判定、调用 id 生成与函数名回填、签名落点、响应与流式解码含累计快照与签名）、Gemini 签名封套。方向：`claude→gemini`、`openai_responses→gemini` | ~2.5k 行 | X1–X3、X5（两个方向）、X11（Gemini 回放）、X12 的 Gemini 项、X14（Gemini） |
 | C5 | 特殊端点（§9）、使用说明（恒等转换的代价、`default_max_output_tokens`、Gemini 2.5 Pro 不可关 thinking、Gemini 3 缺签名限制）、录制夹具 | ~0.6k 行 | X4、X6、X9，端到端 |
 
@@ -556,7 +564,7 @@ pub enum ConvertError {
 4. `ConvertingBody`：放在 `relay_response` 内、`IdleTimeoutBody` 外；`size_hint` 返回 `SizeHint::default()`；`is_end_stream` 恒 false 直到输出缓冲排空且内层 `None`；丢弃内层 trailers；内层 `Err` 或 `feed` 返回 `Err` 时先吐 `finish(Some(err))` 的帧再返回 `Err`；响应头删 `content-length` / `content-encoding`。
 5. `preserve_header_case`：转换请求仍附入站 `Extensions`，不做额外处理（§8.4）。
 6. 访问日志加 `convert` 字段（透传 `-`）；恒等转换器测试同时断言 `attempts`、`upstream`、`status` 不变。
-7. `check` 输出：每个转换上游的方向、`default_max_output_tokens`，以及恒等转换"不再逐字节透传"的提示。
+7. `check` 输出：每个转换上游的方向、`default_max_output_tokens`，以及恒等转换"不再逐字节透传"的提示。**实现状态（C2）**：已输出方向（`convert=<client>-><upstream>`）并按上游协议的端点做 dry-run；跨协议上游输出 `default_max_output_tokens=<N>`；恒等转换改为只改 `model`（§3.1），不再需要"不再逐字节透传"的提示。
 
 ## 12. 风险
 
@@ -569,10 +577,25 @@ pub enum ConvertError {
 | Gemini 2.5 Pro 不能关闭 thinking | `Disabled` 生成 `thinkingBudget: 0` 会被该模型 400；写入使用说明，后续方言配置可改为最小值 |
 | 厂商对 Chat `max_tokens` / `max_completion_tokens` 的取舍 | 本期固定 `max_tokens`；OpenAI o 系模型需要 `max_completion_tokens`，作为方言选项后续处理（§1.2） |
 | 客户端把封套带到别的透传上游 | 恒等 / 透传上游收到 `ccsw1.*` 值会被上游拒绝（签名无效）。使用说明建议同一接口下不要混用"转换上游 + 同协议透传上游"承接带 thinking 的会话；后续可考虑在透传路径识别并剥离封套（会破坏透传承诺，本期不做） |
-| 恒等转换改变了"透传"承诺 | 只在显式配置 `model_map` 时发生；`check` 输出与文档明确其代价；X8 守护透传路径 |
+| 恒等转换改变了"透传"承诺 | 只在显式配置 `model_map` 时发生；实现改为在原始 JSON 上只重写 `model`（§3.1），代价缩小为 JSON 与 SSE 的重新序列化；X8 守护透传路径 |
+| Chat 上游产生的 thinking 没有签名 | Claude 客户端会把无 `signature` 的 thinking 块带回下一轮；发往 Chat 上游时被丢弃（可接受），但若该轮故障转移到同接口的透传 / 恒等 Anthropic 上游，原始请求中的无签名 thinking 块会被 Anthropic 400。与"封套流入透传上游"同类，写入使用说明 |
 | 协议版本演进 | 解析时忽略未知字段；生成时只输出已建模字段 |
 
 ## 13. 修订记录
+
+**v3.1（按 C2 实现同步，基线 `ddece34bf`）**
+
+- §3.1：恒等转换（`claude→claude`）不经 IR 重建，在原始 JSON 上只重写 `model`；响应流式只改 `message_start.message.model`、非流式只改顶层 `model`；body 非 JSON 时 `Unsupported`。`check` 对转换上游按上游协议的端点 dry-run 并追加 `convert=<client>-><upstream>`，跨协议上游再追加 `default_max_output_tokens=<N>`；示例配置新增 `claude→openai_chat` 上游 `deepseek-for-claude`。
+- §5.1：发往 Chat 上游时剥离第一个 system 块开头的 `x-anthropic-billing-header:` 行；`reasoning_effort` 只对 o 系列、`gpt-5` 及以上、`grok-4.5` 及以上、`grok-build-*` 下发；`xhigh` 原样下发不降档（与设计不同，以代码为准）。
+- §5.2 / §11：Anthropic 上游侧（请求生成含合法性规范化、响应与流式解析）推迟到 C3，C2 只有 Anthropic 客户端侧编解码与 Chat 上游侧编解码；X10 随之移到 C3。
+- §6.1 / §6.2 / §6.4：SSE 解析器与重新成帧的行为（注释、`id` / `retry`、CRLF 不保留）；Chat 解码在一个工具块输出期间缓冲其他工具调用、流结束时按序整体输出（交错参数不丢）；流式请求收到 JSON 响应时缓冲（64 MiB 上限）后转换：Chat 方向经 `ir::response_events` 转为 Anthropic 事件流，恒等方向按非流式只改 `model` 并保留上游 `content-type`；上游流正常结束但无 `finish_reason` 时补发 `error` 事件后 body 正常结束。
+- §7 / §8.4：转换路径上游返回压缩响应（`content-encoding` 非 `identity`）时流式与非流式都直接 502 `relay_conversion_error`，不计入熔断；响应头的实际处理分工。
+- §8.1：`ResponseConverter` 要求 `Send + Sync`；`finish` 的错误参数为 `Option<&(dyn Error + 'static)>`；`OutboundRequest` 的 `path` 与 `query` 分开。
+- §8.2：转换结果缓存键为 `(上游协议, 整个 model_map)`，跨故障转移尝试复用；转换器删 `anthropic-*`、`x-stainless-*` 与 `content-length`，`accept-encoding` 由 core 兜底删除。
+- 已知偏离 / 后续事项（复查后保留）：`xhigh` 原样下发；无 `finish_reason` 时以 `error` 事件正常结束；恒等转换重新成帧；`tool_result.is_error` 丢弃；缺 `tool_use_id` 的 `tool_result` 块静默丢弃；o 系列模型的 `temperature` / `top_p` 未门控；恒等非流式响应以 `server.max_body_bytes` 为缓冲上限。
+- §8.3：回放 `LastFailure` 时访问日志的 `upstream` / `convert` 字段取最后一次尝试的值。
+- §9：`claude→openai_chat` 只接受 `POST /v1/messages`；恒等转换对所有端点放行并映射 `model`。
+- §12：补"Chat 上游产生的无签名 thinking 回流到 Anthropic 上游"风险。
 
 **v3（已按 Fable 二次审查修订）**
 
