@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use cc_proxy_core::config::{RelayConfig, Secret, UpstreamConfig};
 use cc_proxy_core::{serve, Relay};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -85,6 +85,18 @@ pub struct MockUpstream {
 impl MockUpstream {
     /// 对每个请求返回同一份响应脚本
     pub async fn start(response: Vec<Segment>) -> Self {
+        Self::start_inner(response, None).await
+    }
+
+    /// HTTPS 版本：用给定的 TLS acceptor 握手后再按脚本应答
+    pub async fn start_tls(response: Vec<Segment>, acceptor: tokio_rustls::TlsAcceptor) -> Self {
+        Self::start_inner(response, Some(acceptor)).await
+    }
+
+    async fn start_inner(
+        response: Vec<Segment>,
+        acceptor: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -95,8 +107,17 @@ impl MockUpstream {
                 };
                 let tx = tx.clone();
                 let response = response.clone();
+                let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    handle_upstream_connection(stream, tx, response).await;
+                    match acceptor {
+                        None => handle_upstream_connection(stream, tx, response).await,
+                        Some(acceptor) => {
+                            // 握手失败（客户端不信任证书）时直接结束
+                            if let Ok(tls) = acceptor.accept(stream).await {
+                                handle_upstream_connection(tls, tx, response).await;
+                            }
+                        }
+                    }
                 });
             }
         });
@@ -126,8 +147,8 @@ impl MockUpstream {
     }
 }
 
-async fn handle_upstream_connection(
-    mut stream: TcpStream,
+async fn handle_upstream_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     tx: mpsc::UnboundedSender<RecordedRequest>,
     response: Vec<Segment>,
 ) {
@@ -147,7 +168,7 @@ async fn handle_upstream_connection(
     let _ = stream.shutdown().await;
 }
 
-async fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Option<RecordedRequest> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let head_len = loop {

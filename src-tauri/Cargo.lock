@@ -778,6 +778,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
  "webpki-roots 0.26.11",
