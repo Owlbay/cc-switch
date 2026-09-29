@@ -20,8 +20,8 @@ use crate::auth::{AuthDecision, InboundAuth};
 use crate::breaker::{CircuitBreaker, Permit};
 use crate::config::{ConfigErrors, RelayConfig};
 use crate::convert::{
-    ConversionContext, ConvertError, Converter, ConvertingBody, InboundRequest, OutboundRequest,
-    ResponseConverter,
+    ConversionContext, ConvertError, Converter, ConvertingBody, InboundRequest, ModelMap,
+    OutboundRequest, ResponseConverter,
 };
 use crate::error::{relay_error, BoxError, RelayBody, RelayErrorKind};
 use crate::headers::{client_response_headers, upstream_auth_header, upstream_request_headers};
@@ -205,6 +205,7 @@ impl Relay {
         let mut last = LastFailure::default();
         // 第一个“无法转换”的原因；所有候选都被跳过时作为 400 的说明
         let mut unsupported: Option<String> = None;
+        let mut converted_cache: Vec<(Interface, &ModelMap, OutboundRequest)> = Vec::new();
 
         for (index, upstream) in candidates.iter().enumerate() {
             if attempts >= max_attempts {
@@ -231,8 +232,30 @@ impl Relay {
                     headers: &parts.headers,
                     body: &body,
                 };
-                match converter.convert_request(&ctx, &inbound) {
-                    Ok(outbound) => Some(outbound),
+                // 同一请求内按（上游协议, model_map）复用转换结果
+                let cached = converted_cache
+                    .iter()
+                    .find(|(protocol, model_map, _)| {
+                        *protocol == upstream.protocol && **model_map == upstream.model_map
+                    })
+                    .map(|(_, _, outbound)| outbound.clone());
+                let result = match cached {
+                    Some(outbound) => Ok(outbound),
+                    None => converter.convert_request(&ctx, &inbound),
+                };
+                match result {
+                    Ok(outbound) => {
+                        if !converted_cache.iter().any(|(protocol, model_map, _)| {
+                            *protocol == upstream.protocol && **model_map == upstream.model_map
+                        }) {
+                            converted_cache.push((
+                                upstream.protocol,
+                                &upstream.model_map,
+                                outbound.clone(),
+                            ));
+                        }
+                        Some(outbound)
+                    }
                     Err(ConvertError::Unsupported(reason)) => {
                         tracing::warn!(
                             request_id = %log.request_id(),
@@ -330,18 +353,20 @@ impl Relay {
                 let retryable = self.retry_on_status.contains(&status.as_u16());
 
                 if has_content_encoding(response.headers()) {
-                    // 转换路径要求上游返回未压缩内容；压缩的响应无法解析
-                    attempt.failure();
+                    // 转换请求已去掉 accept-encoding，上游仍返回压缩内容说明它不遵守协商：
+                    // 属于上游配置问题而非健康问题，不计熔断（guard drop 归还许可），直接报错
                     tracing::warn!(
                         request_id = %log.request_id(),
                         upstream = %upstream.id,
                         "转换上游返回了压缩内容，无法转换"
                     );
-                    last.error = Some(format!(
-                        "upstream {} returned a compressed body that cannot be converted",
-                        upstream.id
-                    ));
-                    continue;
+                    return relay_error(
+                        RelayErrorKind::ConversionFailed,
+                        format!(
+                            "upstream {} returned a compressed body that cannot be converted",
+                            upstream.id
+                        ),
+                    );
                 }
 
                 if status.is_success() {

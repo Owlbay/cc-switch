@@ -473,7 +473,7 @@ async fn internal_conversion_error_is_500() {
 }
 
 #[tokio::test]
-async fn compressed_upstream_response_fails_over() {
+async fn compressed_upstream_response_is_a_conversion_error() {
     let mut a = MockUpstream::start(vec![Segment::now(raw_response(
         "200 OK",
         &[("Content-Encoding", "gzip")],
@@ -482,6 +482,7 @@ async fn compressed_upstream_response_fails_over() {
     .await;
     let mut b = MockUpstream::start(ok_json("{\"from\":\"b\"}")).await;
     let mut config = base_config();
+    config.breaker.failure_threshold = 1;
     config.upstreams.claude = vec![
         converting("a", &a.base_url(), Interface::OpenaiChat),
         upstream("b", &b.base_url()),
@@ -490,8 +491,13 @@ async fn compressed_upstream_response_fails_over() {
 
     let resp = request(relay.addr, &claude_request(b"{}", &[])).await;
     a.next_request().await;
-    b.next_request().await;
-    assert_eq!(resp.body, b"{\"from\":\"b\"}");
+    assert_eq!(resp.status, 502);
+    assert_eq!(resp.json()["error"]["type"], "relay_conversion_error");
+    b.assert_no_request(Duration::from_millis(200)).await;
+
+    // 不计熔断：阈值为 1，a 仍然可用
+    request(relay.addr, &claude_request(b"{}", &[])).await;
+    a.next_request().await;
 }
 
 #[tokio::test]
@@ -508,11 +514,11 @@ async fn stream_broken_mid_way_emits_error_frame_and_cuts_client() {
     )
     .await;
     up.next_request().await;
-    assert!(find(&raw, b"HELLO").is_some());
+    let hello = find(&raw, b"HELLO").expect("converted data");
+    let err = find(&raw, b"|ERR").unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(&raw)));
     assert!(
-        find(&raw, b"|ERR").is_some(),
-        "{}",
-        String::from_utf8_lossy(&raw)
+        hello < err,
+        "error frame must follow the data already relayed"
     );
     assert!(
         find(&raw, b"0\r\n\r\n").is_none(),
@@ -579,4 +585,154 @@ fn with_converter_checks_supported_directions() {
         .err()
         .expect("unsupported direction");
     assert!(error.to_string().contains("claude -> gemini"), "{error}");
+}
+
+// ---------- C1 复查补充 ----------
+
+/// 统计 convert_request 调用次数
+struct CountingConverter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Converter for CountingConverter {
+    fn supports(&self, client: Interface, upstream: Interface) -> bool {
+        MarkConverter.supports(client, upstream)
+    }
+    fn convert_request(
+        &self,
+        ctx: &ConversionContext<'_>,
+        request: &InboundRequest<'_>,
+    ) -> Result<OutboundRequest, ConvertError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        MarkConverter.convert_request(ctx, request)
+    }
+    fn response_converter(
+        &self,
+        ctx: &ConversionContext<'_>,
+        meta: &OutboundMeta,
+    ) -> Box<dyn ResponseConverter> {
+        MarkConverter.response_converter(ctx, meta)
+    }
+}
+
+#[tokio::test]
+async fn conversion_is_reused_across_attempts_with_the_same_target() {
+    let mut a = MockUpstream::start(vec![Segment::now(raw_response(
+        "503 Service Unavailable",
+        &[],
+        b"busy",
+    ))])
+    .await;
+    let mut b = MockUpstream::start(ok_json("{}")).await;
+    let mut c = MockUpstream::start(ok_json("{}")).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut config = base_config();
+    let mut mapped = converting("c", &c.base_url(), Interface::OpenaiChat);
+    mapped.model_map.insert("*".into(), "other".into());
+    config.upstreams.claude = vec![
+        converting("a", &a.base_url(), Interface::OpenaiChat),
+        converting("b", &b.base_url(), Interface::OpenaiChat),
+        mapped,
+    ];
+    let relay = start_with(config, Arc::new(CountingConverter(Arc::clone(&calls)))).await;
+
+    request(relay.addr, &claude_request(b"{}", &[])).await;
+    a.next_request().await;
+    b.next_request().await;
+    c.assert_no_request(Duration::from_millis(100)).await;
+    // a、b 同协议同 model_map：只转换一次
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unsupported_skip_returns_the_half_open_probe() {
+    let mut a = MockUpstream::start(vec![Segment::now(raw_response(
+        "503 Service Unavailable",
+        &[],
+        b"busy",
+    ))])
+    .await;
+    let mut b = MockUpstream::start(ok_json("{\"from\":\"b\"}")).await;
+    let mut config = base_config();
+    config.breaker.failure_threshold = 1;
+    config.breaker.open_secs = 1;
+    config.upstreams.claude = vec![
+        converting("a", &a.base_url(), Interface::OpenaiChat),
+        upstream("b", &b.base_url()),
+    ];
+    let relay = start_with(config, Arc::new(MarkConverter)).await;
+
+    // a 失败一次 → 打开
+    request(relay.addr, &claude_request(b"{}", &[])).await;
+    a.next_request().await;
+    b.next_request().await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // 半开：Unsupported 跳过 a 并归还探测名额
+    let resp = request(relay.addr, &claude_request(b"UNSUPPORTED", &[])).await;
+    assert_eq!(resp.status, 200);
+    b.next_request().await;
+    a.assert_no_request(Duration::from_millis(100)).await;
+
+    // 探测名额仍可用：下一个正常请求探测 a
+    request(relay.addr, &claude_request(b"{}", &[])).await;
+    a.next_request().await;
+}
+
+#[tokio::test]
+async fn buffered_bodies_over_their_limits_are_conversion_errors() {
+    let big = "x".repeat(4096);
+    let mut ok_up = MockUpstream::start(ok_json(&big)).await;
+    let mut err_up = MockUpstream::start(vec![Segment::now(raw_response(
+        "400 Bad Request",
+        &[],
+        big.as_bytes(),
+    ))])
+    .await;
+    let mut config = base_config();
+    config.server.max_body_bytes = 1024;
+    config.failover.retry_body_bytes = 1024;
+    config.upstreams.claude = vec![converting("ok", &ok_up.base_url(), Interface::OpenaiChat)];
+    config.upstreams.openai_responses =
+        vec![converting("err", &err_up.base_url(), Interface::Claude)];
+    let relay = start_with(config, Arc::new(MarkConverter)).await;
+
+    let resp = request(relay.addr, &claude_request(b"{}", &[])).await;
+    ok_up.next_request().await;
+    assert_eq!(resp.status, 502);
+    assert_eq!(resp.json()["error"]["type"], "relay_conversion_error");
+
+    let resp = request(
+        relay.addr,
+        &raw_request(
+            "POST",
+            "/v1/responses",
+            &[
+                ("Host", "relay"),
+                ("Authorization", &format!("Bearer {RELAY_TOKEN}")),
+            ],
+            b"{}",
+        ),
+    )
+    .await;
+    err_up.next_request().await;
+    assert_eq!(resp.status, 502);
+    assert_eq!(resp.json()["error"]["type"], "relay_conversion_error");
+}
+
+#[tokio::test]
+async fn passthrough_edge_cases_never_reach_the_converter() {
+    let trailer = b"HTTP/1.1 200 OK\r\nTrailer: X-Checksum\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n".to_vec();
+    let mut up = MockUpstream::start(vec![Segment::now(trailer)]).await;
+    let mut config = base_config();
+    config.upstreams.claude = vec![upstream("c", &up.base_url())];
+    let relay = start_with(config, Arc::new(PanicConverter)).await;
+
+    let mut raw = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: relay\r\nx-api-key: {RELAY_TOKEN}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    raw.extend_from_slice(b"5\r\n{\"a\":\r\n3\r\n12}\r\n0\r\n\r\n");
+    let resp = request(relay.addr, &raw).await;
+    assert_eq!(resp.body, b"hello");
+    assert!(find(&resp.raw, b"X-Checksum").is_none());
+    assert_eq!(up.next_request().await.body, b"{\"a\":12}");
 }

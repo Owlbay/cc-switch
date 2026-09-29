@@ -181,7 +181,8 @@ where
                 if this.error.is_some() && !this.yielded_before_error {
                     // 错误帧刚交给 hyper、还在写缓冲里：若同一轮就返回 Err，hyper 会直接断开
                     // 连接而丢掉它们。先让出一次，hyper 的连接循环会在 body Pending 时 flush，
-                    // 下一轮再返回 Err 中断客户端连接。
+                    // 下一轮再返回 Err 中断客户端连接。尽力而为：若这次 flush 遇到 socket
+                    // 背压未写完，剩余的错误帧仍可能丢失（错误帧很小，实际影响可忽略）。
                     this.yielded_before_error = true;
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
