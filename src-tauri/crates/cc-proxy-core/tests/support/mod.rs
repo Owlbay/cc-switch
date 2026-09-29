@@ -413,6 +413,9 @@ pub fn upstream(id: &str, base_url: &str) -> UpstreamConfig {
         auth: None,
         strip_prefix: None,
         proxy_url: None,
+        protocol: None,
+        model_map: Default::default(),
+        default_max_output_tokens: None,
     }
 }
 

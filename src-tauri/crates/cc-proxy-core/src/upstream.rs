@@ -22,6 +22,7 @@ use url::Url;
 
 use crate::breaker::CircuitBreaker;
 use crate::config::{validate_base_url, validate_proxy_url, AuthScheme, RelayConfig, Secret};
+use crate::convert::ModelMap;
 use crate::interface::Interface;
 use crate::tls::{self, TlsError};
 
@@ -203,6 +204,12 @@ pub struct ResolvedUpstream {
     pub client: Arc<UpstreamClient>,
     /// 按上游计数的熔断器（§5.5）
     pub breaker: CircuitBreaker,
+    /// 上游说的协议（缺省等于所在接口）
+    pub protocol: Interface,
+    pub model_map: ModelMap,
+    pub default_max_output_tokens: u64,
+    /// 是否经过转换器（协议转换或恒等转换）；为 false 时逐字节透传
+    pub converts: bool,
 }
 
 /// 按接口分组的上游列表（保持配置顺序）
@@ -251,6 +258,10 @@ impl UpstreamSet {
                     api_key: upstream.api_key.clone(),
                     client,
                     breaker: CircuitBreaker::from_config(&config.breaker),
+                    protocol: upstream.protocol_for(interface),
+                    model_map: upstream.model_map.clone(),
+                    default_max_output_tokens: upstream.default_max_output_tokens(),
+                    converts: upstream.converts(interface),
                 }));
             }
             by_interface.insert(interface, resolved);
@@ -347,6 +358,9 @@ mod tests {
             auth: None,
             strip_prefix: None,
             proxy_url: proxy_url.map(str::to_string),
+            protocol: None,
+            model_map: Default::default(),
+            default_max_output_tokens: None,
         }
     }
 

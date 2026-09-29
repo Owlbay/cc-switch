@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::convert::ModelMap;
 use crate::interface::Interface;
 use crate::upstream_url::{is_valid_strip_prefix, looks_like_endpoint_path};
 
@@ -203,7 +204,7 @@ pub struct UpstreamConfig {
     pub base_url: String,
     #[serde(default)]
     pub api_key: Secret,
-    /// 缺省按接口取 [`AuthScheme::default_for`]
+    /// 缺省按上游协议取 [`AuthScheme::default_for`]
     #[serde(default)]
     pub auth: Option<AuthScheme>,
     #[serde(default)]
@@ -211,12 +212,42 @@ pub struct UpstreamConfig {
     /// 覆盖全局 `proxy_url`；空字符串表示该上游直连
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// 上游说的协议；缺省等于所在接口（透传）。与接口不同时需要协议转换器
+    #[serde(default)]
+    pub protocol: Option<Interface>,
+    /// 模型名映射（客户端模型 → 上游模型，`*` 兜底）。非空时即使同协议也走恒等转换，
+    /// 不再逐字节透传
+    #[serde(default)]
+    pub model_map: ModelMap,
+    /// 转换路径上客户端没有指定输出上限时写入上游请求的值（缺省
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`]）；透传路径不使用
+    #[serde(default)]
+    pub default_max_output_tokens: Option<u64>,
 }
 
+/// 转换路径的缺省输出上限
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 16384;
+
 impl UpstreamConfig {
+    /// 上游实际说的协议
+    pub fn protocol_for(&self, interface: Interface) -> Interface {
+        self.protocol.unwrap_or(interface)
+    }
+
+    /// 是否需要经过转换器（协议转换或同协议 + model_map 的恒等转换）
+    pub fn converts(&self, interface: Interface) -> bool {
+        self.protocol_for(interface) != interface || !self.model_map.is_empty()
+    }
+
+    pub fn default_max_output_tokens(&self) -> u64 {
+        self.default_max_output_tokens
+            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+    }
+
+    /// 缺省按**上游协议**取鉴权方式（如 claude 接口下的 openai_chat 上游默认 Bearer）
     pub fn auth_scheme(&self, interface: Interface) -> AuthScheme {
         self.auth
-            .unwrap_or_else(|| AuthScheme::default_for(interface))
+            .unwrap_or_else(|| AuthScheme::default_for(self.protocol_for(interface)))
     }
 
     /// 该上游实际使用的出站代理：上游配置优先，空字符串表示直连。
@@ -391,8 +422,28 @@ fn validate_upstreams(
                 errors.push(format!("{label}: proxy_url {message}"));
             }
         }
+
+        if upstream
+            .model_map
+            .iter()
+            .any(|(from, to)| from.is_empty() || to.is_empty())
+        {
+            errors.push(format!("{label}: model_map 的键与值都不能为空字符串"));
+        }
+        if upstream.default_max_output_tokens == Some(0) {
+            errors.push(format!("{label}: default_max_output_tokens 必须大于 0"));
+        }
+        if upstream.converts(interface) && !CONVERTIBLE_CLIENTS.contains(&interface) {
+            errors.push(format!(
+                "{label}: {} 接口的协议转换 / model_map 本期不支持（仅 claude、openai_responses 接口可配置 protocol 与 model_map）",
+                interface.as_str()
+            ));
+        }
     }
 }
+
+/// 本期可作为转换客户端协议的接口
+pub const CONVERTIBLE_CLIENTS: [Interface; 2] = [Interface::Claude, Interface::OpenaiResponses];
 
 /// 解析并校验 `base_url`：只允许 http / https，必须有 host，不允许 userinfo 与 fragment。
 pub fn validate_base_url(raw: &str) -> Result<Url, String> {
@@ -439,6 +490,9 @@ mod tests {
             auth: None,
             strip_prefix: None,
             proxy_url: None,
+            protocol: None,
+            model_map: ModelMap::new(),
+            default_max_output_tokens: None,
         }
     }
 
@@ -600,6 +654,93 @@ mod tests {
         assert_eq!(up.auth_scheme(Interface::Gemini), AuthScheme::XGoogApiKey);
         up.auth = Some(AuthScheme::Bearer);
         assert_eq!(up.auth_scheme(Interface::Claude), AuthScheme::Bearer);
+    }
+
+    #[test]
+    fn auth_default_follows_upstream_protocol() {
+        let mut up = upstream("u", "https://example.com");
+        up.protocol = Some(Interface::OpenaiChat);
+        assert!(up.converts(Interface::Claude));
+        assert_eq!(up.auth_scheme(Interface::Claude), AuthScheme::Bearer);
+        up.protocol = Some(Interface::Gemini);
+        assert_eq!(
+            up.auth_scheme(Interface::OpenaiResponses),
+            AuthScheme::XGoogApiKey
+        );
+        up.auth = Some(AuthScheme::XApiKey);
+        assert_eq!(
+            up.auth_scheme(Interface::OpenaiResponses),
+            AuthScheme::XApiKey
+        );
+    }
+
+    #[test]
+    fn conversion_rules() {
+        let mut same = upstream("same", "https://example.com");
+        assert!(!same.converts(Interface::Claude));
+        same.protocol = Some(Interface::Claude);
+        assert!(
+            !same.converts(Interface::Claude),
+            "explicit same protocol is passthrough"
+        );
+        same.model_map.insert("a".into(), "b".into());
+        assert!(
+            same.converts(Interface::Claude),
+            "model_map forces identity conversion"
+        );
+
+        let mut config = valid_config();
+        let mut chat = upstream("chat", "https://example.com");
+        chat.protocol = Some(Interface::OpenaiChat);
+        let mut bad_map = upstream("bad-map", "https://example.com");
+        bad_map.model_map.insert("".into(), "x".into());
+        bad_map.default_max_output_tokens = Some(0);
+        config.upstreams.claude.push(chat.clone());
+        config.upstreams.claude.push(bad_map);
+        let mut from_chat = upstream("from-chat", "https://example.com");
+        from_chat.protocol = Some(Interface::Claude);
+        config.upstreams.openai_chat = vec![from_chat];
+        let mut gemini_map = upstream("gemini-map", "https://example.com");
+        gemini_map.model_map.insert("a".into(), "b".into());
+        config.upstreams.gemini = vec![gemini_map];
+        config.upstreams.openai_responses = vec![chat];
+
+        let errors = errors_of(&config).join("\n");
+        assert!(errors.contains("[bad-map]: model_map"), "{errors}");
+        assert!(
+            errors.contains("[bad-map]: default_max_output_tokens"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("openai_chat[from-chat]: openai_chat 接口的协议转换"),
+            "{errors}"
+        );
+        assert!(
+            errors.contains("gemini[gemini-map]: gemini 接口的协议转换"),
+            "{errors}"
+        );
+        assert!(!errors.contains("claude[chat]"), "{errors}");
+        assert!(!errors.contains("openai_responses[chat]"), "{errors}");
+    }
+
+    #[test]
+    fn protocol_and_model_map_deserialize() {
+        let json = serde_json::json!({
+            "server": { "auth_tokens": ["t"] },
+            "upstreams": { "claude": [{
+                "id": "c", "base_url": "https://api.deepseek.com", "api_key": "k",
+                "protocol": "openai_chat",
+                "model_map": { "claude-sonnet-5": "deepseek-chat", "*": "deepseek-chat" }
+            }] }
+        });
+        let config: RelayConfig = serde_json::from_value(json).unwrap();
+        let up = &config.upstreams.claude[0];
+        assert_eq!(up.protocol, Some(Interface::OpenaiChat));
+        assert_eq!(
+            up.model_map.get("*").map(String::as_str),
+            Some("deepseek-chat")
+        );
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

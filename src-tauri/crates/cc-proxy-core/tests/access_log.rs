@@ -167,6 +167,7 @@ async fn one_complete_line_per_request_without_secrets() {
     assert_eq!(line.field("path"), "/v1/messages");
     assert_eq!(line.field("interface"), "claude");
     assert_eq!(line.field("upstream"), "a");
+    assert_eq!(line.field("convert"), "-");
     assert_eq!(line.field("attempts"), "1");
     assert_eq!(line.field("status"), "200");
     assert_eq!(line.field("outcome"), "complete");

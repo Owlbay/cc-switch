@@ -40,6 +40,7 @@ pub struct AccessLog {
     head_elapsed: Option<Duration>,
     request_bytes: u64,
     status: Option<u16>,
+    convert: Option<(Interface, Interface)>,
     streaming: bool,
     emitted: bool,
 }
@@ -59,6 +60,7 @@ impl AccessLog {
             head_elapsed: None,
             request_bytes: 0,
             status: None,
+            convert: None,
             streaming: false,
             emitted: false,
         }
@@ -76,10 +78,11 @@ impl AccessLog {
         self.request_bytes = bytes as u64;
     }
 
-    /// 开始一次上游尝试
-    pub fn start_attempt(&mut self, upstream: &str) {
+    /// 开始一次上游尝试；`convert` 为该次尝试的转换方向（客户端协议 → 上游协议），透传为 None
+    pub fn start_attempt(&mut self, upstream: &str, convert: Option<(Interface, Interface)>) {
         self.attempts += 1;
         self.upstream = Some(upstream.to_string());
+        self.convert = convert;
     }
 
     /// 收到上游响应头
@@ -124,6 +127,9 @@ impl AccessLog {
         }
         self.emitted = true;
         let head_ms = self.head_elapsed.map(|d| d.as_millis() as u64);
+        let convert = self
+            .convert
+            .map(|(from, to)| format!("{}->{}", from.as_str(), to.as_str()));
         tracing::info!(
             target: ACCESS_TARGET,
             request_id = %self.request_id,
@@ -131,6 +137,7 @@ impl AccessLog {
             path = %self.path,
             interface = self.interface.map(|i| i.as_str()).unwrap_or("-"),
             upstream = self.upstream.as_deref().unwrap_or("-"),
+            convert = convert.as_deref().unwrap_or("-"),
             attempts = self.attempts,
             status = self.status.unwrap_or(0),
             head_ms = head_ms.unwrap_or(0),
