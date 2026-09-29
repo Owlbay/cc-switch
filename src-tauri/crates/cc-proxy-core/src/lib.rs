@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod forward;
 pub mod headers;
+pub mod idle;
 pub mod interface;
 pub mod server;
 pub mod tls;

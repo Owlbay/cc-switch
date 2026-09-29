@@ -20,6 +20,7 @@ use crate::breaker::{CircuitBreaker, Permit};
 use crate::config::RelayConfig;
 use crate::error::{relay_error, BoxError, RelayBody, RelayErrorKind};
 use crate::headers::{client_response_headers, upstream_auth_header, upstream_request_headers};
+use crate::idle::IdleTimeoutBody;
 use crate::interface::{identify, Interface};
 use crate::upstream::{BuildError, ResolvedUpstream, UpstreamSet};
 use crate::upstream_url::{upstream_host, upstream_uri};
@@ -31,6 +32,7 @@ pub struct Relay {
     max_body_bytes: usize,
     preserve_header_case: bool,
     response_head_timeout: Duration,
+    idle_timeout: Duration,
     retry_on_status: Vec<u16>,
     retry_body_bytes: usize,
     max_attempts: Option<usize>,
@@ -46,6 +48,7 @@ impl Relay {
             max_body_bytes: usize::try_from(config.server.max_body_bytes).unwrap_or(usize::MAX),
             preserve_header_case: config.server.preserve_header_case,
             response_head_timeout: Duration::from_secs(config.timeouts.response_head_secs),
+            idle_timeout: Duration::from_secs(config.timeouts.idle_secs),
             retry_on_status: config.failover.retry_on_status.clone(),
             retry_body_bytes: usize::try_from(config.failover.retry_body_bytes)
                 .unwrap_or(usize::MAX),
@@ -187,7 +190,7 @@ impl Relay {
 
             if !self.retry_on_status.contains(&response.status().as_u16()) {
                 attempt.success();
-                return relay_response(response, self.preserve_header_case);
+                return relay_response(response, self.preserve_header_case, self.idle_timeout);
             }
 
             attempt.failure();
@@ -204,12 +207,13 @@ impl Relay {
                     .any(|next| next.breaker.is_available(Instant::now()));
             if !has_next {
                 // 已是最后一次可能的尝试：原样流式转发，不缓冲、不截断
-                return relay_response(response, self.preserve_header_case);
+                return relay_response(response, self.preserve_header_case, self.idle_timeout);
             }
             match buffer_response(
                 response,
                 self.retry_body_bytes,
                 self.preserve_header_case,
+                self.idle_timeout,
                 &upstream.id,
             )
             .await
@@ -285,13 +289,15 @@ fn build_upstream_request(
 }
 
 /// 上游响应原样流回：状态码与 body 不变，响应头只去掉 hop-by-hop。
+/// 超过 `idle_timeout` 没有新数据时中断客户端连接（§5.4）。
 fn relay_response(
     response: Response<hyper::body::Incoming>,
     preserve_header_case: bool,
+    idle_timeout: Duration,
 ) -> Response<RelayBody> {
     let (mut parts, body) = response.into_parts();
     let headers = client_response_headers(&parts.headers);
-    let mut out = Response::new(body.map_err(BoxError::from).boxed());
+    let mut out = Response::new(IdleTimeoutBody::new(body, idle_timeout).boxed());
     *out.status_mut() = parts.status;
     *out.headers_mut() = headers;
     if preserve_header_case {
@@ -321,9 +327,11 @@ async fn buffer_response(
     response: Response<hyper::body::Incoming>,
     limit: usize,
     preserve_header_case: bool,
+    idle_timeout: Duration,
     upstream_id: &str,
 ) -> Result<Response<RelayBody>, String> {
     let (mut parts, body) = response.into_parts();
+    let body = IdleTimeoutBody::new(body, idle_timeout);
     let bytes = match Limited::new(body, limit).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(error) if error.is::<LengthLimitError>() => {
