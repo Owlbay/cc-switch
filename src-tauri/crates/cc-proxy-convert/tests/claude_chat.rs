@@ -176,7 +176,7 @@ async fn start_relay(claude: Vec<UpstreamConfig>) -> (SocketAddr, oneshot::Sende
 async fn send(addr: SocketAddr, body: &Value) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let body = body.to_string();
     let request = format!(
-        "POST /v1/messages?beta=true HTTP/1.1\r\nHost: relay\r\nx-api-key: {TOKEN}\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /v1/messages?beta=true HTTP/1.1\r\nHost: relay\r\nx-api-key: {TOKEN}\r\nanthropic-version: 2023-06-01\r\nX-Stainless-Lang: js\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -332,6 +332,7 @@ async fn non_streaming_claude_to_chat() {
     );
     assert!(header(&up_headers, "anthropic-version").is_none());
     assert!(header(&up_headers, "x-api-key").is_none());
+    assert!(header(&up_headers, "x-stainless-lang").is_none());
     assert_eq!(sent["model"], "deepseek-chat");
     assert_eq!(
         sent["messages"][0],
@@ -515,4 +516,84 @@ async fn count_tokens_skips_the_chat_upstream() {
     assert!(raw.starts_with(b"HTTP/1.1 200"));
     assert_eq!(anthropic.next().await.0, "/v1/messages/count_tokens");
     chat.assert_idle().await;
+}
+
+#[tokio::test]
+async fn streaming_request_answered_with_json_becomes_an_anthropic_stream() {
+    let mut up = Upstream::start(json_response(
+        "200 OK",
+        &json!({
+            "id": "chatcmpl-1", "model": "deepseek-chat",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "hello"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        }),
+    ))
+    .await;
+    let (addr, _stop) = start_relay(vec![upstream(
+        "chat",
+        &up.url(),
+        Some(Interface::OpenaiChat),
+    )])
+    .await;
+
+    let (status, headers, body) = send(addr, &claude_request(true)).await;
+    up.next().await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+    let (names, blocks, message_delta) = rebuild_anthropic_stream(&body);
+    assert_eq!(names.last().map(String::as_str), Some("message_stop"));
+    assert_eq!(blocks, vec![json!({"type": "text", "text": "hello"})]);
+    assert_eq!(message_delta["delta"]["stop_reason"], "end_turn");
+}
+
+#[tokio::test]
+async fn identity_streaming_rewrites_only_message_start() {
+    let events = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-5","usage":{"input_tokens":1}}}"#,
+        "\n\nevent: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"model claude-sonnet-4-5"}}"#,
+        "\n\nevent: message_stop\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n"
+    );
+    let mut up = Upstream::start(sse_response(events, 5)).await;
+    let mut identity = upstream("anthropic", &up.url(), None);
+    identity
+        .model_map
+        .insert("claude-sonnet-5".into(), "claude-sonnet-4-5".into());
+    let (addr, _stop) = start_relay(vec![identity]).await;
+
+    let (status, _, body) = send(addr, &claude_request(true)).await;
+    let (_, headers, sent) = up.next().await;
+    assert_eq!(sent["model"], "claude-sonnet-4-5");
+    assert_eq!(header(&headers, "anthropic-version"), Some("2023-06-01"));
+    assert_eq!(status, 200);
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        events.replacen(
+            "\"model\":\"claude-sonnet-4-5\"",
+            "\"model\":\"claude-sonnet-5\"",
+            1
+        )
+    );
+}
+
+#[tokio::test]
+async fn identity_streaming_request_answered_with_json_keeps_json() {
+    let reply = json!({"id": "msg_1", "model": "claude-sonnet-4-5", "content": []});
+    let mut up = Upstream::start(json_response("200 OK", &reply)).await;
+    let mut identity = upstream("anthropic", &up.url(), None);
+    identity
+        .model_map
+        .insert("claude-sonnet-5".into(), "claude-sonnet-4-5".into());
+    let (addr, _stop) = start_relay(vec![identity]).await;
+
+    let (status, headers, body) = send(addr, &claude_request(true)).await;
+    up.next().await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-type"), Some("application/json"));
+    let mut expected = reply.clone();
+    expected["model"] = json!("claude-sonnet-5");
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
 }

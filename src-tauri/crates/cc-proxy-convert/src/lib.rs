@@ -129,7 +129,7 @@ fn claude_to_chat_request(
     )
     .map_err(ConvertError::Unsupported)?;
 
-    let mut headers = protocol_neutral_headers(request.headers, &["anthropic-"]);
+    let mut headers = protocol_neutral_headers(request.headers, &["anthropic-", "x-stainless-"]);
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -167,11 +167,36 @@ fn protocol_neutral_headers(headers: &HeaderMap, prefixes: &[&str]) -> HeaderMap
 // 响应：恒等
 // ---------------------------------------------------------------------------
 
+/// 客户端要求流式、上游却返回完整 JSON 时，缓冲整段 body 的上限
+const JSON_FALLBACK_LIMIT: usize = 64 * 1024 * 1024;
+
+/// 成功响应但 content-type 是 JSON：上游忽略了 `stream`（或端点本来就不流式）
+fn is_json_response(status: StatusCode, headers: &HeaderMap) -> bool {
+    status.is_success()
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("json"))
+}
+
+/// 缓冲一段 body；超过上限视为上游响应错误
+fn buffer_json(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ConvertError> {
+    if buffer.len() + chunk.len() > JSON_FALLBACK_LIMIT {
+        return Err(ConvertError::Response(format!(
+            "non-streaming upstream response exceeds {JSON_FALLBACK_LIMIT} bytes"
+        )));
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// 恒等转换的响应：只把模型名改回客户端请求的名字
 struct IdentityResponse {
     protocol: Interface,
     client_model: String,
     parser: sse::SseParser,
+    /// 流式请求收到了 JSON 响应：缓冲后按非流式改写
+    json: Option<Vec<u8>>,
 }
 
 impl IdentityResponse {
@@ -180,6 +205,7 @@ impl IdentityResponse {
             protocol,
             client_model: meta.client_model.clone(),
             parser: sse::SseParser::new(),
+            json: None,
         }
     }
 
@@ -207,16 +233,31 @@ impl IdentityResponse {
 }
 
 impl ResponseConverter for IdentityResponse {
-    fn convert_head(&mut self, _status: StatusCode, headers: &HeaderMap) -> HeaderMap {
+    fn convert_head(&mut self, status: StatusCode, headers: &HeaderMap) -> HeaderMap {
+        if is_json_response(status, headers) {
+            self.json = Some(Vec::new());
+        }
         headers.clone()
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, ConvertError> {
+        if let Some(buffer) = &mut self.json {
+            buffer_json(buffer, chunk)?;
+            return Ok(Vec::new());
+        }
         let events = self.parser.feed(chunk);
         Ok(self.reframe(events))
     }
 
     fn finish(&mut self, error: Option<&(dyn std::error::Error + 'static)>) -> Vec<Bytes> {
+        if let Some(buffer) = self.json.take() {
+            // 出错时 body 已不完整，原样交出已收到的部分，由客户端按截断处理
+            if error.is_some() {
+                return vec![Bytes::from(buffer)];
+            }
+            let body = self.convert_full(StatusCode::OK, &buffer);
+            return vec![body.unwrap_or_else(|_| Bytes::from(buffer))];
+        }
         let events = self.parser.finish();
         let mut out = self.reframe(events);
         if let (Some(error), Interface::Claude) = (error, self.protocol) {
@@ -252,6 +293,8 @@ struct ChatToAnthropic {
     parser: sse::SseParser,
     decoder: chat::StreamDecoder,
     encoder: anthropic::StreamEncoder,
+    /// 流式请求收到了 JSON 响应：缓冲后整体转换成 Anthropic 事件流
+    json: Option<Vec<u8>>,
 }
 
 impl ChatToAnthropic {
@@ -262,12 +305,29 @@ impl ChatToAnthropic {
             parser: sse::SseParser::new(),
             decoder: chat::StreamDecoder::new(),
             encoder: anthropic::StreamEncoder::new(meta.client_model.clone()),
+            json: None,
+        }
+    }
+
+    fn encode_buffered(&mut self, buffer: &[u8]) -> Vec<Bytes> {
+        let response = serde_json::from_slice::<Value>(buffer)
+            .map_err(|e| format!("upstream returned invalid JSON: {e}"))
+            .and_then(|value| chat::parse_response(&value));
+        match response {
+            Ok(response) => ir::response_events(&response)
+                .into_iter()
+                .flat_map(|event| self.encoder.encode(event))
+                .collect(),
+            Err(message) => self.encoder.finish(Some(&message)),
         }
     }
 }
 
 impl ResponseConverter for ChatToAnthropic {
     fn convert_head(&mut self, status: StatusCode, headers: &HeaderMap) -> HeaderMap {
+        if self.stream && is_json_response(status, headers) {
+            self.json = Some(Vec::new());
+        }
         let mut out = protocol_neutral_headers(headers, &["openai-"]);
         out.remove(header::CONTENT_TYPE);
         let content_type = if self.stream && status.is_success() {
@@ -280,6 +340,10 @@ impl ResponseConverter for ChatToAnthropic {
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<Bytes>, ConvertError> {
+        if let Some(buffer) = &mut self.json {
+            buffer_json(buffer, chunk)?;
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         for event in self.parser.feed(chunk) {
             for ir_event in self.decoder.feed(&event.data) {
@@ -290,6 +354,12 @@ impl ResponseConverter for ChatToAnthropic {
     }
 
     fn finish(&mut self, error: Option<&(dyn std::error::Error + 'static)>) -> Vec<Bytes> {
+        if let Some(buffer) = self.json.take() {
+            return match error {
+                Some(error) => self.encoder.finish(Some(&error.to_string())),
+                None => self.encode_buffered(&buffer),
+            };
+        }
         let mut out = Vec::new();
         for event in self.parser.finish() {
             for ir_event in self.decoder.feed(&event.data) {

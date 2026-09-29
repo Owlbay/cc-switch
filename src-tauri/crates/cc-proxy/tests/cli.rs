@@ -111,7 +111,7 @@ fn example_config_passes_check() {
     }
     assert!(
         stdout.contains(
-            "  deepseek-for-claude -> https://api.deepseek.com:443/v1/chat/completions  auth=bearer via=direct convert=claude->openai_chat"
+            "  deepseek-for-claude -> https://api.deepseek.com:443/v1/chat/completions  auth=bearer via=direct convert=claude->openai_chat default_max_output_tokens=8192"
         ),
         "{stdout}"
     );

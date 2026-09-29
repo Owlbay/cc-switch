@@ -35,14 +35,18 @@ pub fn report(relay: &Relay) -> String {
                 sample_path(upstream.protocol),
                 None,
             );
-            let convert = if upstream.converts {
-                format!(
-                    " convert={}->{}",
-                    interface.as_str(),
-                    upstream.protocol.as_str()
-                )
-            } else {
+            let convert = if !upstream.converts {
                 String::new()
+            } else if upstream.protocol == interface {
+                format!(" convert={}->{}", interface.as_str(), interface.as_str())
+            } else {
+                // 跨协议时客户端可不给 max_tokens，打印兜底值便于核对
+                format!(
+                    " convert={}->{} default_max_output_tokens={}",
+                    interface.as_str(),
+                    upstream.protocol.as_str(),
+                    upstream.default_max_output_tokens
+                )
             };
             let _ = writeln!(
                 out,

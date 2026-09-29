@@ -652,12 +652,15 @@ impl StreamDecoder {
             return;
         }
 
-        // 未开块：参数可能先于 id / name 到达，先缓冲
+        // 未开块：参数可能先于 id / name 到达，先缓冲。另一个工具块正在输出时也只缓冲：
+        // 兼容网关可能交错发送多个工具的参数，而已关闭的块无法再追加，这些工具在
+        // 流结束时按顺序整体输出
         self.tools[position]
             .1
             .buffered_arguments
             .push_str(&arguments);
-        if self.tools[position].1.name.is_some() {
+        let tool_open = matches!(self.open, Some((OpenKind::Tool(_), _)));
+        if self.tools[position].1.name.is_some() && !tool_open {
             self.start_tool(position, out);
         }
     }
@@ -1049,6 +1052,45 @@ mod tests {
                         ..Default::default()
                     }
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn interleaved_tool_arguments_are_not_lost() {
+        let events = decode(&[
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"A","arguments":"{\"x"}},{"index":1,"id":"b","function":{"name":"B","arguments":"{\"y"}}]}}]}"#,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":1}"}}]}}]}"#,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\":2}"}}]}}]}"#,
+            r#"{"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        // 按块重建：每个块 start/stop 成对、参数完整
+        let mut blocks: Vec<(String, String, bool)> = Vec::new();
+        for event in &events {
+            match event {
+                Event::BlockStart {
+                    index,
+                    kind: BlockKind::ToolCall { name, .. },
+                } => {
+                    assert_eq!(*index, blocks.len());
+                    blocks.push((name.clone(), String::new(), false));
+                }
+                Event::ToolArgumentsDelta {
+                    index,
+                    partial_json,
+                } => {
+                    assert!(!blocks[*index].2, "delta after stop");
+                    blocks[*index].1.push_str(partial_json);
+                }
+                Event::BlockStop { index } => blocks[*index].2 = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            blocks,
+            vec![
+                ("A".into(), "{\"x\":1}".into(), true),
+                ("B".into(), "{\"y\":2}".into(), true),
             ]
         );
     }

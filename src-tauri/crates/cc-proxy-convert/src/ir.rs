@@ -286,6 +286,73 @@ pub enum Event {
     },
 }
 
+/// 非流式响应 → 等价的规范化事件序列。用于客户端要求流式、上游却返回了完整 JSON 的情况；
+/// 图片、文档、工具结果不会出现在模型输出中，忽略
+pub fn response_events(response: &Response) -> Vec<Event> {
+    let mut out = vec![Event::Start {
+        id: response.id.clone(),
+        model: response.model.clone(),
+        usage: Usage::default(),
+    }];
+    let mut index = 0;
+    for block in &response.content {
+        let (kind, deltas) = match block {
+            Block::Text { text } => (
+                BlockKind::Text,
+                vec![Event::TextDelta {
+                    index,
+                    text: text.clone(),
+                }],
+            ),
+            Block::Thinking { text, signature } => {
+                let mut deltas = vec![Event::ThinkingDelta {
+                    index,
+                    text: text.clone(),
+                }];
+                if let Some(signature) = signature {
+                    deltas.push(Event::SignatureDelta {
+                        index,
+                        signature: signature.clone(),
+                    });
+                }
+                (BlockKind::Thinking, deltas)
+            }
+            Block::RedactedThinking { signature } => (
+                BlockKind::RedactedThinking,
+                vec![Event::SignatureDelta {
+                    index,
+                    signature: signature.clone(),
+                }],
+            ),
+            Block::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => (
+                BlockKind::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                },
+                vec![Event::ToolArgumentsDelta {
+                    index,
+                    partial_json: arguments.clone(),
+                }],
+            ),
+            Block::Image { .. } | Block::Document { .. } | Block::ToolResult { .. } => continue,
+        };
+        out.push(Event::BlockStart { index, kind });
+        out.extend(deltas);
+        out.push(Event::BlockStop { index });
+        index += 1;
+    }
+    out.push(Event::Finish {
+        stop_reason: response.stop_reason.clone(),
+        usage: response.usage,
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
