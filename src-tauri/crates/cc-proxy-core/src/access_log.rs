@@ -99,7 +99,12 @@ impl AccessLog {
     /// 对固定 body 的响应（中转自身响应、回放的缓冲响应、HEAD / 204 / 304 等）：立即写出一行。
     pub fn finish(mut self, response: Response<RelayBody>) -> Response<RelayBody> {
         self.status = Some(response.status().as_u16());
-        let bytes = response.body().size_hint().exact().unwrap_or(0);
+        // HEAD 响应不发送 body
+        let bytes = if self.method == Method::HEAD {
+            0
+        } else {
+            response.body().size_hint().exact().unwrap_or(0)
+        };
         self.emit("complete", bytes, None);
         response
     }
@@ -181,9 +186,9 @@ where
                 if let Some(data) = frame.data_ref() {
                     this.bytes += data.remaining() as u64;
                 }
-                // 已知长度的 body 在最后一帧之后就是 end_stream：hyper 不再 poll 出 None，
-                // 而是直接 drop body，所以在这里就要记为 complete
-                if this.inner.is_end_stream() {
+                // hyper 在两种情况下读完最后一帧后直接 drop body、不再 poll 出 None：
+                // 已知长度的 body 读到最后一帧（end_stream），以及读到 trailers 帧。
+                if frame.is_trailers() || this.inner.is_end_stream() {
                     if let Some(mut log) = this.log.take() {
                         log.emit("complete", this.bytes, None);
                     }

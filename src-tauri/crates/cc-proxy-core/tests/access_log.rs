@@ -422,3 +422,35 @@ async fn idle_timeout_mid_stream_is_error() {
     assert!(access[0].field("error").contains("no data"), "{access:?}");
     capture.assert_no_secret(&secrets());
 }
+
+#[tokio::test]
+async fn trailers_and_head_are_logged_correctly() {
+    let capture = Capture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+
+    let mut up = MockUpstream::start(vec![Segment::now(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTrailer: X-Checksum\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n".to_vec(),
+    )])
+    .await;
+    let mut config = base_config();
+    config.upstreams.claude = vec![upstream("a", &up.base_url())];
+    let relay = start_relay(config).await;
+
+    let resp = request(relay.addr, &claude_request()).await;
+    assert_eq!(resp.body, b"hello");
+    up.next_request().await;
+    let head = request(
+        relay.addr,
+        &raw_request("HEAD", "/_relay/health", &[("Host", "relay")], b""),
+    )
+    .await;
+    assert_eq!(head.status, 200);
+
+    let access = capture.wait_access(2).await;
+    assert_eq!(access.len(), 2, "{access:?}");
+    // 读到 trailers 后 hyper 直接 drop body：仍应记为 complete
+    assert_eq!(access[0].field("outcome"), "complete");
+    assert_eq!(access[0].field("response_bytes"), "5");
+    assert_eq!(access[1].field("method"), "HEAD");
+    assert_eq!(access[1].field("response_bytes"), "0");
+}
