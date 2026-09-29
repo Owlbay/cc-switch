@@ -201,6 +201,8 @@ impl Relay {
                 status = response.status().as_u16(),
                 "上游返回可重试状态码"
             );
+            // is_available 只是快照：若到下一个上游时探测名额已被并发请求占用，循环会结束并
+            // 回放这里缓冲的响应，结果与直接流式转发等价（body 不超过 retry_body_bytes 时）。
             let has_next = attempts < max_attempts
                 && candidates[index + 1..]
                     .iter()

@@ -285,7 +285,31 @@ async fn t6_stateful_responses_calls_stay_on_the_first_upstream() {
 // ---------- T8 ----------
 
 #[tokio::test]
-async fn t8_breaker_skips_a_failing_upstream_and_probes_after_open_period() {
+async fn t8_breaker_skips_a_failing_upstream() {
+    let mut a = MockUpstream::start(status("503 Service Unavailable", &[], "{}")).await;
+    let mut b = MockUpstream::start(ok("{\"from\":\"b\"}")).await;
+    let relay = relay_with(|c| {
+        c.breaker.failure_threshold = 2;
+        // 打开期足够长，慢机上也不会在断言前进入半开
+        c.breaker.open_secs = 60;
+        c.upstreams.claude = vec![upstream("a", &a.base_url()), upstream("b", &b.base_url())];
+    })
+    .await;
+
+    for _ in 0..2 {
+        assert_eq!(send_messages(&relay).await.status, 200);
+        a.next_request().await;
+        b.next_request().await;
+    }
+
+    // 阈值已达到：a 被跳过
+    assert_eq!(send_messages(&relay).await.status, 200);
+    b.next_request().await;
+    a.assert_no_request(Duration::from_millis(200)).await;
+}
+
+#[tokio::test]
+async fn t8_breaker_probes_after_open_period() {
     let mut a = MockUpstream::start(status("503 Service Unavailable", &[], "{}")).await;
     let mut b = MockUpstream::start(ok("{\"from\":\"b\"}")).await;
     let relay = relay_with(|c| {
@@ -301,12 +325,7 @@ async fn t8_breaker_skips_a_failing_upstream_and_probes_after_open_period() {
         b.next_request().await;
     }
 
-    // 阈值已达到：a 被跳过
-    assert_eq!(send_messages(&relay).await.status, 200);
-    b.next_request().await;
-    a.assert_no_request(Duration::from_millis(200)).await;
-
-    // 打开期过后放行一次探测
+    // 打开期（1 秒）过后放行一次探测；等待更久只会更早进入半开，不影响断言
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(send_messages(&relay).await.status, 200);
     a.next_request().await;
