@@ -785,8 +785,10 @@ dependencies = [
  "bytes",
  "cc-proxy-core",
  "http",
+ "httparse",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
