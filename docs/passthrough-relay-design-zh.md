@@ -1,7 +1,7 @@
 # 透传中转 core 设计方案
 
-> 状态：草案 v3.3（已按 R4 实施结果同步）· 基线：`refactor/standalone-proxy-core@5e6abca5f`
-> 实现位置：`src-tauri/crates/cc-proxy-core/`（R1–R4 已实施，R4 不含拦截器；R5 待做，见 §12）。
+> 状态：草案 v3.4（已按 R5 实施结果同步，R1–R5 全部实施）· 基线：`refactor/standalone-proxy-core@ba16ab849`
+> 实现位置：`src-tauri/crates/cc-proxy-core/`（引擎 lib）与 `src-tauri/crates/cc-proxy/`（可执行程序）。R1–R5 已实施，R4 不含拦截器（§7 暂缓），见 §12。使用说明见 `docs/cc-proxy-usage-zh.md`。
 > 取代：`docs/standalone-proxy-core-design-zh.md` 中 P2 及之后"搬迁现有代理"的路线。该文档的调研结论、P0（workspace 骨架）与已完成的 P1 前两步仍然有效。
 > 库行为引用的源码版本以 `src-tauri/Cargo.lock` 锁定版本为准：hyper 1.8.1、hyper-util 0.1.20、hyper-rustls 0.27.7、rustls 0.23.37、axum 0.7.9（§9）。
 > v3 中标注"原型实测"的结论来自 `/tmp/relay-proto`（锁定版本搭建的最小原型：自建 http1 accept loop + axum `fallback` + legacy Client + 原始 socket mock 上游）。R2 实际实现改用 hyper `service_fn`、不引入 axum（§9），原型中与 axum 无关的结论仍然有效，并已由集成测试重新验证。
@@ -366,14 +366,45 @@ src-tauri/crates/
 │       ├── cancellation.rs  # T7、T12（R3）
 │       ├── relay_endpoints.rs # /_relay/health、T9 启动校验（R4）
 │       ├── access_log.rs    # T11：捕获用 Subscriber + 8 个场景（R4）
+│       ├── shutdown.rs      # 优雅退出：进行中的流完成后才返回、空闲连接不阻塞（R5）
 │       └── fixtures/tls/    # 预生成的测试 CA 与 localhost 证书（README.md 记录重新生成方法）
-└── cc-proxy/                # 可执行程序（R5）
-    └── src/
-        ├── main.rs          # CLI：serve / check
-        └── config_file.rs   # TOML 读取、${ENV} 展开
+└── cc-proxy/                # 可执行程序（R5，bin 名 cc-proxy）
+    ├── config.example.toml  # 示例配置（tests/cli.rs 保证它始终能通过 check）
+    ├── src/
+    │   ├── main.rs          # clap 子命令 serve / check；日志初始化；信号处理与限时排空
+    │   ├── config_file.rs   # 配置路径查找、TOML 读取、${VAR} 展开（§10）
+    │   └── check.rs         # dry-run 报告（每个上游的典型路径 URL、鉴权方式、出站方式）、文件权限提示
+    └── tests/
+        └── cli.rs           # 用 CARGO_BIN_EXE_cc-proxy 跑真实进程的端到端测试（§11）
 ```
 
-入站不用 `axum::serve`：它内部用 `hyper_util::server::conn::auto::Builder`（`axum-0.7.9/src/serve.rs:19,254`）且不暴露 `preserve_header_case`/`auto_date_header`。**已实施（R2）**：core 自己写 accept loop，用 `hyper::server::conn::http1::Builder`（`timer(TokioTimer)`、`preserve_header_case`）+ `hyper::service::service_fn` 直接调用 `Relay::handle`，**不用 axum / tower**；所有路由判断在 `interface::identify` 内完成。每个连接一个 `tokio::spawn`，单个请求的转发路径上没有任何 spawn，取消语义（§5.4）依然靠 drop 传播。`serve(listener, relay, shutdown)` 在 `shutdown` 完成后停止接受新连接，已建立的连接处理完当前请求。`HeaderCaseMap` 经 `extensions` 在 server → client、client → server 两个方向都能传递（T2、T3 集成测试守护）。
+入站不用 `axum::serve`：它内部用 `hyper_util::server::conn::auto::Builder`（`axum-0.7.9/src/serve.rs:19,254`）且不暴露 `preserve_header_case`/`auto_date_header`。**已实施（R2）**：core 自己写 accept loop，用 `hyper::server::conn::http1::Builder`（`timer(TokioTimer)`、`preserve_header_case`）+ `hyper::service::service_fn` 直接调用 `Relay::handle`，**不用 axum / tower**；所有路由判断在 `interface::identify` 内完成。每个连接一个 `tokio::spawn`，单个请求的转发路径上没有任何 spawn，取消语义（§5.4）依然靠 drop 传播。`HeaderCaseMap` 经 `extensions` 在 server → client、client → server 两个方向都能传递（T2、T3 集成测试守护）。
+
+**优雅退出（已实施 R5，`server.rs`）**。`serve(listener, relay, shutdown)` 的语义：
+
+- 连接任务放在一个 `tokio::task::JoinSet` 里（不再是裸 `tokio::spawn`）；accept loop 每轮先 `try_join_next` 回收已结束的任务，避免长期运行时集合无限增长。
+- `shutdown` future 完成后：跳出 accept loop 并 drop 监听器（新连接立即被拒），通过 `watch` 通道向每个连接任务发停止信号；连接任务收到后调用 hyper `Connection::graceful_shutdown`——空闲的 keep-alive 连接立即关闭，正在处理的请求（含 SSE 流）继续到结束。信号只会从 `false` 变为 `true` 一次，发送端被 drop 同样视为停止，所以连接建立在信号之前或之后都不会错过。
+- 之后 `join_next` 到集合为空，`serve` 才返回。**core 不设超时**：需要限时的调用方自己用 `tokio::time::timeout` 之类包住 `serve`，drop 该 future 即 abort 所有连接任务。
+- `cc-proxy serve` 的用法：`shutdown` future 等 SIGINT / SIGTERM（unix；其它平台只等 Ctrl-C），在其内部记"收到退出信号"日志（排空可能在同一轮就完成，日志放在外面会错过）；随后 `select!` 等 `serve` 返回、`--grace-secs`（默认 10）超时或再次收到信号，后两者立即退出进程。退出码：正常退出 0、配置错误 2、运行时错误（绑定失败、运行时创建失败）或强制退出（排空超时、再次收到信号——此时可能截断了进行中的流，用非 0 告知调用方）1。
+
+**`cc-proxy` 可执行程序结构与依赖（已实施 R5）**。`main.rs` 用 clap derive 定义 `serve [--config] [--listen ADDR] [--grace-secs N]` 与 `check [--config]`；`--listen` 覆盖配置后由 `Relay::new` 内的 `validate` 重新校验（含 §6.2 匿名规则）。`serve` 绑定成功后向 **stdout 只打印一行** `listening on ADDR`（`--listen 127.0.0.1:0` 时给脚本 / 测试拿实际端口），所有日志经 `tracing-subscriber` 的 `fmt` + `EnvFilter` 写到 **stderr**，`serve` 默认级别 `info`、`check` 默认 `warn`（报告写 stdout，core 加载证书等环节的告警仍能到 stderr），`RUST_LOG` 覆盖；`RUST_LOG` 设置了但无法解析时回退到该默认级别，并在订阅器安装后记一条 warn 说明原因。`check` 不发请求：加载、校验、`Relay::new`（真实加载 TLS 与 `extra_ca_file`），再对每个上游用该接口的典型路径（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`、`/v1beta/models/...:streamGenerateContent`）调用 `upstream_uri` 打印最终 URL、鉴权方式（`x-api-key` / `bearer` / ...）与出站方式（`direct` / `http-proxy` / `socks5`）；URL 中 query 只保留参数名（`api-version=***`），不打印任何 Key。unix 上配置文件对 group / other 可读（`mode & 0o077 != 0`）时 `check` 与 `serve` 都给 warn。
+
+`cc-proxy` 依赖（`src-tauri/crates/cc-proxy/Cargo.toml`）：
+
+| crate | Cargo.toml 版本 | 锁定版本 | features | default-features | 用途 / 选型理由 |
+|---|---|---|---|---|---|
+| `cc-proxy-core` | path | — | — | — | 引擎 |
+| `clap` | `~4.5` | 4.5.61 | `std`, `derive`, `help`, `usage`, `error-context` | **`false`** | 子命令解析。固定 `~4.5`：4.6 会把 `syn 3` 带进锁文件；关掉 `color` / `suggestions` 以免引入 `anstream` / `strsim` |
+| `toml` | `0.8` | 0.8.23 | — | 默认 | 复用锁文件已有的 0.8.23（锁文件另有 toml 0.9，写 `0.9` 会多一套 `toml_edit`）；先 `from_str` 成 `toml::Value` 再 `try_into::<RelayConfig>()` |
+| `tokio` | `1` | 1.50.0 | `rt-multi-thread`, `macros`, `net`, `time`, `signal`, `sync` | 默认 | 多线程运行时、`ctrl_c` / `SignalKind::terminate` |
+| `tracing` | `0.1` | 0.1.44 | — | 默认 | 日志 |
+| `tracing-subscriber` | `0.3` | 0.3.23 | `std`, `fmt`, `env-filter` | **`false`** | 日志输出；`env-filter` 的 `regex` 已在锁文件；不开 `ansi`，避免 `nu-ansi-term` |
+| `serde` | `1.0` | 1.0.228 | `derive` | 默认 | 与 core 一致 |
+| `thiserror` | `2.0` | 2.0.18 | — | 默认 | `ConfigFileError` |
+| `http`（dev） | `1` | 1.4.0 | — | 默认 | `check.rs` 单测用 `identify` 反查典型路径 |
+| `tokio`（dev） | `1` | 1.50.0 | `rt-multi-thread`, `macros`, `net`, `io-util`, `time` | 默认 | `tests/cli.rs` 的原始 socket mock 上游与客户端 |
+
+不引入 `dirs`（默认配置路径直接用 `HOME` / `USERPROFILE`）、`tempfile`（测试用 `std::env::temp_dir()` + 进程 id + 计数器）、`tokio-util`（排空用 `JoinSet` + `watch` 即可）。
 
 ### 9.1 依赖表
 
@@ -405,7 +436,7 @@ src-tauri/crates/
 | `tokio-rustls` | `0.26` | 0.26.4 | `ring`, `tls12`, `logging` | **`false`**（dev） | **dev-dependency**：T15 的自签 HTTPS mock 上游 |
 | `tokio`（dev） | `1` | 1.50.0 | `macros`, `rt-multi-thread`, `test-util` | 默认 | **dev-dependency**：集成测试多线程运行时；`test-util` 供 `idle.rs` 单元测试用 `start_paused` 虚拟时钟（R3） |
 
-未纳入（较 v3 删除或推迟）：`axum`、`tower`、`futures-util`（入站不用 axum，流适配用 `http-body-util`）；`rustls-pki-types`（经 `rustls::pki_types` 使用）；`async-trait`（R4 引入拦截器时再加）；`rcgen`（不在锁文件里，T15 改用预生成证书）；`toml`、`clap`、`tracing-subscriber`（属 `cc-proxy` 可执行程序，R5）。
+未纳入（较 v3 删除或推迟）：`axum`、`tower`、`futures-util`（入站不用 axum，流适配用 `http-body-util`）；`rustls-pki-types`（经 `rustls::pki_types` 使用）；`async-trait`（R4 引入拦截器时再加）；`rcgen`（不在锁文件里，T15 改用预生成证书）；`toml`、`clap`、`tracing-subscriber`（属 `cc-proxy` 可执行程序，见上表）。core 自身的 `tokio` 不需要 `signal`，信号处理只在 `cc-proxy` 里。
 
 - `cc-proxy-core` 不依赖 `cc-switch-domain` 以外的 app 代码，也不依赖 `tauri`、`rusqlite`（`scripts/check-proxy-core-deps.sh` 已在 CI 中守护）。
 - HTTP 客户端选 hyper 而不是 reqwest：reqwest 会自行补充部分默认头，并在启用相应 feature 时自动解压；hyper 对头和 body 的控制更直接，便于保证 §2 的透传边界。
@@ -471,9 +502,20 @@ base_url = "https://generativelanguage.googleapis.com"
 api_key = "${GEMINI_API_KEY}"
 ```
 
-- `${VAR}` 在加载时展开；变量未定义时报错退出。
+上面只是节选；可直接使用的完整示例在 `src-tauri/crates/cc-proxy/config.example.toml`（`tests/cli.rs` 的 `example_config_passes_check` 保证它始终能通过 `check`），安装、客户端接入与日志说明在 `docs/cc-proxy-usage-zh.md`。
+
+**`${VAR}` 展开（已实施 R5，`config_file.rs`）**：
+
+- 先把整个文件 `toml::from_str` 成 `toml::Value`，再递归遍历，**只对字符串值**展开；表的键、数字、布尔等不碰。不在原始文本上替换，所以变量值里的引号、`]]`、换行都不会破坏 TOML 结构（单测覆盖）。
+- `${NAME}` 的 `NAME` 必须匹配 `[A-Za-z_][A-Za-z0-9_]*`；`$${` 是转义，得到字面量 `${`；其它 `$` 原样保留；`${` 没有闭合的 `}` 报错（避免拼错的引用被当作字面量 Key 发出去）。
+- **不做二次展开**：替换结果里的 `${...}` 按字面量保留，环境变量的值不能再引用别的变量。
+- 变量未定义时报错并给出所在位置（如 `配置文件 x.toml 中 upstreams.claude[0].api_key: 引用了未定义的环境变量 ANTHROPIC_API_KEY`），只出现变量名，不出现任何变量值。
+- 展开后 `Value::try_into::<RelayConfig>()`（toml 0.8.23 的 Value 反序列化器与 `deny_unknown_fields`、`SocketAddr`、`PathBuf`、`#[serde(transparent)] Secret`、kebab-case 单元枚举都兼容；代价是错误里没有行列号，所以展开错误自带字段路径）。serde 的类型错误会回显字符串值（如 `invalid type: string "sk-…", expected u64`），而该值可能是展开后的环境变量（`${SECRET}` 误写在数值字段上），因此配置解析错误里的 `string "..."` 一律替换为 `string "***"`（单测 `type_errors_do_not_echo_expanded_values`）；取值校验由 `Relay::new` 内的 `validate` 完成。
+
+配置文件路径查找顺序：`--config` 参数 > 环境变量 `CC_PROXY_CONFIG`（非空） > `$HOME/.cc-proxy/config.toml`（Windows 为 `%USERPROFILE%\.cc-proxy\config.toml`）；都没有时报配置错误（退出码 2）。
+
 - 某个接口没有配置上游时，该接口的请求返回 `503`。
-- `cc-proxy check --config <path>` 只校验配置、打印每个上游的 dry-run URL，不发请求。
+- `cc-proxy check --config <path>` 只校验配置、打印每个上游的 dry-run URL，不发请求；成功退出码 0，配置有误 2。
 
 ## 11. 测试与验收
 
@@ -497,6 +539,8 @@ api_key = "${GEMINI_API_KEY}"
 | T14 | 出站代理：经本地 mock HTTP CONNECT 代理与 mock SOCKS5 代理各转发一次，上游收到的字节与直连相同；`socks5h` 下 mock 代理收到的是域名而非 IP；`http://` 无显式端口的上游经 CONNECT 代理时，mock 代理收到 `CONNECT host:80`（§5.6） |
 | T15 | TLS：mock HTTPS 上游用自签证书，仅 `extra_ca_file` 指向该 CA 时成功，否则 TLS 失败（R2：返回 `502` `relay_bad_gateway`；R3 起触发故障转移）。证书为 `tests/fixtures/tls/` 下用 openssl 预生成的测试 CA（`ca.pem`，P-256，CA 私钥生成后已丢弃）与 `localhost` 服务端证书（`localhost.pem` / `localhost.key`，SAN 含 `DNS:localhost`、`IP:127.0.0.1`），不引入 `rcgen`（不在锁文件里）；重新生成步骤见 `tests/fixtures/tls/README.md`，三个文件需一并替换 |
 | T16 | URL 拼接：`strip_prefix` 命中/未命中、`base_url` 带 query 合并、`check` 对含端点路径的 `base_url` 报错 |
+| T17 | **已实施（R5，core `tests/shutdown.rs`，2 个）**。(1) `in_flight_stream_finishes_before_serve_returns`：mock 上游发出 SSE 头与首个事件后延迟 500 ms 再发剩余部分；客户端收到首个事件后触发 `shutdown`，150 ms 后断言 `serve` 任务**仍未结束**、新连接被拒（`connect` 失败），随后客户端收到完整 body `data: 1\n\ndata: 2\n\n`，`serve` 在 2 秒内返回。(2) `idle_connections_do_not_block_shutdown`：一条连上但从不发请求的连接 + 一条完成过一次 keep-alive 请求后保持的连接，触发 `shutdown` 后 `serve` 在 2 秒内返回 |
+| T18 | **已实施（R5，`cc-proxy/tests/cli.rs`，7 个）**，用 `std::process::Command` 跑 `env!("CARGO_BIN_EXE_cc-proxy")`，每个测试写独立的 600 权限配置文件。(1) `check_prints_dry_run_urls_without_secrets`：claude 直连上游 + 带 `?api-version=` 与 `socks5h` 代理的 openai_chat 上游，stdout 含 `anthropic -> https://api.anthropic.com:443/v1/messages  auth=x-api-key via=direct` 与 `...openai/v1/chat/completions?api-version=***  auth=bearer via=socks5`、未配置的接口标注 503；stdout / stderr 都不含中转 token、上游 Key 与 `api-version` 的值；600 权限时 stderr 为空。(2) `example_config_passes_check`：`config.example.toml` 在设好其引用的 5 个环境变量后通过 `check`，四个上游都出现在报告中。(3) `check_reports_undefined_variable_by_location`：退出码 2，stderr 含 `upstreams.claude[0].api_key` 与变量名。(4) `check_rejects_public_listener_without_tokens`：`0.0.0.0` + `allow_anonymous` 退出码 2，stderr 含 `server.auth_tokens`。(5) `missing_config_file_is_a_config_error`：不存在的 `--config` 退出码 2，stderr 含该路径。(6) `serve_relays_and_drains_on_sigterm`（unix）：`serve --listen 127.0.0.1:0`，从 stdout 第一行解析地址（20 秒内），原始 socket 发 `POST /v1/messages?q=QUERY-MARKER` 到 mock SSE 上游，收到首个事件后 `kill -TERM`；断言客户端仍收到完整 chunked 结束标记、上游收到的起始行 / `x-api-key: <上游 Key>` / body 逐字节正确且不含中转 token，进程 10 秒内以 0 退出，stderr 含访问日志（`outcome="complete"`）与"收到退出信号"，且不含 token、Key、body 标记、query 标记。(7) `forced_exit_after_grace_returns_non_zero`（unix）：`--grace-secs 0`，同样在收到首个 SSE 事件后 `kill -TERM`，进程 10 秒内退出且退出码为 1（排空期为 0，进行中的流被截断）。`ChildGuard` 在 Drop 里 kill 子进程，失败也不遗留进程 |
 
 另外做一次真实上游冒烟：本地起 `cc-proxy`，让 Claude Code、Codex CLI、Gemini CLI 分别指向它，完成一次带工具调用的流式对话。需要真实 Key，由使用者在本机执行；同时核对 §14 的待确认项。
 
@@ -510,7 +554,7 @@ api_key = "${GEMINI_API_KEY}"
 | R2 **已实施** | `tls`、`upstream`（`UpstreamClient` enum、`UpstreamSet` 按代理设置共享 `Client`、CONNECT/SOCKS 鉴权拼装，§5.6）、`server`（自建 http1 accept loop + `service_fn`，不用 axum，§9）、`forward`（`Relay::handle`：单上游透传，四个接口，流式响应）；接入 R1 的 `auth`；原始 socket 测试基建（`tests/support`）。**验收结果**：T1–T5、T9 鉴权部分、T13、T14、T15 共 27 个集成测试外加若干单元测试全部通过；workspace 全量测试 3200 通过、0 失败、9 忽略。**变异验证**：去掉 `extensions` 搬运后 T2 失败；改成整体缓冲后 T4 失败；对调 `socks5` / `socks5h` 的解析方式后两个 SOCKS 测试都失败。T14 的 CONNECT 用例用带显式端口的上游，`http` 上游缺省端口补 80 由 `upstream_url` 单元测试覆盖。**未实现，留给 R3**：T12 取消测试、故障转移循环、`response_head` / `idle` 超时 | T1–T5、T9（鉴权部分）、T13、T14、T15 |
 | R3 **已实施** | 故障转移循环（`max_attempts`、`has_next` 快照、`last_response` 回放最近一次缓冲、`retry_canceled_requests` 保持 `true`、有状态 Responses 调用限 1 次，§5.2）、每上游熔断器接入（`ResolvedUpstream.breaker`、`AttemptGuard`、`is_available`，§5.5）、`response_head_timeout` 与 `idle_timeout`（`IdleTimeoutBody`，§5.4）、取消语义验证。提交：9b2263ebd、03fbf4fc3、b3318e1c4、05e72d924。**验收结果**：T6、T8 共 14 个测试，空闲超时 3 个，T7、T12 共 4 个，全部通过；workspace 全量 3225 个测试通过、0 失败、9 忽略；core 的测试连续跑 3 次都稳定。**变异验证**：让熔断器始终放行，T8 失败；可重试状态不触发故障转移，T6 失败；关掉空闲超时，stalled 测试失败；把上游请求放进 `spawn`，T12 失败 | T6–T8、T12 |
 | R4 **已实施（不含拦截器）** | `/_relay/health`（`GET` / `HEAD`，先于鉴权，不暴露配置，其它 `/_relay/*` 404，§8）、T9 启动校验测试、访问日志（`access_log.rs`：`AccessLog` / `LoggedBody`、`ACCESS_TARGET`、四种 `outcome`、warn 带 `request_id`，§8）、`Relay::handle` 拆成 `handle` + `dispatch` 以覆盖每条返回路径。`intercept` 按用户决定暂缓（§7、T10）。提交：13d8ade11、e5458e0b4。**验收结果**：`relay_endpoints.rs` 5 个、`access_log.rs` 8 个全部通过；workspace 全量 3240 个测试通过、0 失败、9 忽略；core 的测试连续跑 2 次都稳定。**变异验证**：日志 `path` 带上 query 后 T11 失败；"已知长度 body 被误记为 `aborted`"（hyper 在最后一帧后直接 drop body、不再 poll 出 `None`）这个缺陷由 T11 场景 (1) 发现，修正为在 `poll_frame` 里每读完一个 data 帧就检查 `is_end_stream` | T9（启动校验）、T11；T10 暂缓 |
-| R5 | `cc-proxy` 可执行程序：TOML 配置、`${ENV}` 展开、`serve`、`check`（dry-run URL）、示例配置与 `docs/` 使用说明（含 §6.2 匿名风险） | 用本机 mock 上游端到端跑通；真实上游冒烟与 §14 核对由使用者执行 |
+| R5 **已实施** | `cc-proxy` 可执行程序（§9、§10）：`config_file.rs`（路径查找、TOML → `Value` → 只展开字符串值的 `${VAR}` → `RelayConfig`）、`check.rs`（dry-run 报告、权限提示）、`main.rs`（clap `serve` / `check`，stdout 一行 `listening on ADDR`，日志到 stderr，SIGINT / SIGTERM 限时排空）；core `server.rs` 改为 `JoinSet` + `watch` + `graceful_shutdown`，进行中的流完成后 `serve` 才返回；`config.example.toml` 与 `docs/cc-proxy-usage-zh.md`（三个 CLI 的接入、§6.2 匿名风险、日志说明）。提交：9de481721（bin、配置加载、check）、5d79be7d4（core 优雅退出 + `tests/shutdown.rs`）、28757c5c7（serve、日志、`tests/cli.rs`）、9525bb377（示例配置与使用说明）、ba16ab849（审查后的次要修复：`check` 初始化日志到 stderr 默认 `warn`、解析错误中的字符串值替换为 `***`、强制退出返回 1、`RUST_LOG` 无法解析时回退并告警）。**验收结果**：workspace 全量 3258 个测试通过、0 失败、9 忽略（ba16ab849 前）；`cc-proxy` 共 18 个测试（`config_file` 8、`check` 3、`tests/cli.rs` 7）。**变异验证**：去掉连接任务的 `graceful_shutdown` 调用后空闲连接测试（T17-2）超时；去掉 `serve` 末尾的 `join_next` 排空后进行中的流测试（T17-1）失败；让程序收到信号后立即退出时 SIGTERM 端到端测试（T18-6）报告流被截断 | T17、T18 通过；真实上游冒烟与 §14 核对由使用者执行 |
 
 **R1 实施须知**（R1 已按此完成，保留作为约束记录）：
 
@@ -553,12 +597,16 @@ api_key = "${GEMINI_API_KEY}"
 | C2 | **已实证（v3）**：Codex CLI 0.155.1 二进制字符串——连通性探测要求 `GET /models returns 2xx, 401, or 403`，404 时提示 `provider base URL route returned 404 - verify the configured API prefix`（`/v1/models` 请求由 `model-provider/src/models_endpoint.rs` 发出），模型拉取失败记 `Failed to fetch models: `，均为提示、不阻断会话。§3 不合成响应，透传上游结果。**冒烟时核对**：上游返回 2xx 时 Codex 的模型列表正常；上游 404 时仅出现该提示 |
 | C3 | Codex CLI 0.155.1 二进制仍含 `previous_response_id`（5 处）与 `conversation_id`（2 处）字符串，无法从二进制判断默认路径是否使用；冒烟时用 mock 上游记录请求 body，确认是否带 `previous_response_id` / `store` | 决定 §5.2 Responses 限制是否影响实际使用 |
 | C4 | 三个 CLI 实际发出的头是否全部为 HTTP/1.1（Codex 的 reqwest 默认可能协商 HTTP/2，但指向 `http://127.0.0.1` 时为 h1） | 决定 §2.3 的 HTTP/1.1 假设是否成立 |
+| C5 | 使用说明（`docs/cc-proxy-usage-zh.md` "待实际验证"）中的 Codex 接入写法：`[model_providers.<id>]` 用 `base_url = "http://127.0.0.1:15721/v1"`、`wire_api = "responses"`、`env_key = "CC_PROXY_TOKEN"`，`env_key` 在所用版本中是否生效（桌面端接管写的是 `auth.json` 的 `OPENAI_API_KEY` 占位符，`src-tauri/src/services/proxy.rs:232`，与 `requires_openai_auth` 回退是两条路，说明里推荐 `env_key`） | 决定使用说明 Codex 一节是否要改 |
+| C6 | Gemini CLI（API Key 模式）：`~/.gemini/.env` 的 `GOOGLE_GEMINI_BASE_URL` / `GEMINI_API_KEY`（与桌面端接管一致，`src-tauri/src/live/project/gemini.rs:24-25`）加 `settings.json` 的 `security.auth.selectedType = "gemini-api-key"` 是否足够；token 经 `x-goog-api-key` 头还是 `?key=` 发出（两种中转都接受，§6.1） | 决定使用说明 Gemini 一节是否要改 |
+| C7 | Claude Code：`ANTHROPIC_AUTH_TOKEN`（`Authorization: Bearer`）与 `ANTHROPIC_API_KEY`（`x-api-key`）二选一指向中转后，带工具调用的流式对话与 `/model` 列表（C1 开关开启时）正常；Responses 有状态用法（`previous_response_id`，C3）在多上游故障转移下不保证连续，说明里已注明 | 决定使用说明 Claude 一节与"限制"一节是否要改 |
 
 ## 15. 修订记录
 
 | 版本 | 日期 | 内容 |
 |---|---|---|
 | v1 | 2026-09-29 | 初稿 |
+| v3.4 | 2026-09-30 | 按 R5 实施结果同步（对照 `crates/cc-proxy/src/{main,config_file,check}.rs`、`crates/cc-proxy/tests/cli.rs`、core `server.rs` 与 `tests/shutdown.rs`、`config.example.toml`、`docs/cc-proxy-usage-zh.md`，提交 9de481721、5d79be7d4、28757c5c7、9525bb377，以及审查后修复 ba16ab849）：状态改为 R1–R5 全部实施，基线更新；§9 目录补 `cc-proxy` 实际结构（`check.rs`、`config.example.toml`、`tests/cli.rs`）与 core `tests/shutdown.rs`，写明 `serve` 的优雅退出语义（`JoinSet` + `try_join_next` 回收、`watch` 停止信号、hyper `graceful_shutdown`、core 不设超时由调用方包裹）、`cc-proxy serve` / `check` 的行为（stdout 只一行 `listening on ADDR`、日志到 stderr、`serve` 默认 `info` / `check` 默认 `warn`、`RUST_LOG` 无法解析时回退并告警、退出码 0 / 2 / 1 且强制退出记 1、限时排空与再次信号即退）与依赖表（`clap ~4.5` 精简 features 及固定 4.5 的理由、`tracing-subscriber` 不开 `ansi`、`toml 0.8` 复用锁文件、不引入 `dirs` / `tempfile` / `tokio-util`）；§10 写明 `${VAR}` 实际规则（解析后只展开字符串值、不二次展开、`$${` 转义、未闭合报错、未定义变量按位置报错且不印值、解析错误中的字符串值替换为 `***`、`Value::try_into` 兼容性）与配置路径查找顺序，指向 `config.example.toml` 与 `docs/cc-proxy-usage-zh.md`；§11 新增 T17（shutdown 2 个）与 T18（cc-proxy 端到端 7 个，含强制退出返回 1）及其验证点；§12 R5 标"已实施"，写入 5 个提交、验收结果（workspace 3258 通过 / 0 失败 / 9 忽略，cc-proxy 18 个测试）与三项变异验证；§14 新增 C5–C7，同步使用说明中"待实际验证"的 Codex `env_key`、Gemini `.env` / `selectedType` 与 token 携带方式、Claude Code 两种凭据变量 |
 | v3.3 | 2026-09-29 | 按 R4 实施结果同步（对照 `access_log.rs`、`forward.rs` 与 `tests/{access_log,relay_endpoints}.rs`，提交 13d8ade11、e5458e0b4）：§7 拦截器标"按用户决定暂缓，本期不实现"，设计内容保留作参考；§8 按 `access_log.rs` 重写：字段表、`ACCESS_TARGET`、四种 `outcome`（`complete` / `error` / `aborted` / `cancelled`）的语义与写出时机（含已知长度 body 在最后一帧后被 hyper 直接 drop 的处理）、`request_id` 格式 `r-{n:x}` 且不写入响应头、warn 带 `request_id`、`/_relay/health` 的 `GET` / `HEAD` 免鉴权与其它方法 / 路径 404；§9 目录补 `access_log.rs` 与 R3/R4 测试文件，去掉 `intercept.rs`；§11 记录 T11 的捕获用 Subscriber 与 `set_default` 在 current_thread 下可用的理由，T9 启动校验标"已实施"，T10 标"暂缓"，T11 写入 8 个场景；§12 R4 标"已实施（不含拦截器）"并写入提交、验收结果（workspace 3240 通过 / 0 失败 / 9 忽略，core 连跑 2 次稳定）与两项变异验证 |
 | v3.2 | 2026-09-29 | 按 R3 实施结果同步（对照 `forward.rs`、`idle.rs`、`breaker.rs`、`upstream.rs` 与 `tests/{failover,timeouts,cancellation}.rs`）：§5.2 "全部失败"规则改为回放最近一次完整缓冲的 `last_response`，只有完全没有可回放响应时才 `502`，一次都没尝试（全部熔断）时 `503`；§5.2 补 `max_attempts = min(配置, 上游数)`、有状态 `GET/DELETE /v1/responses/*` 只试 1 次且网络错误也不换上游、最后一次尝试遇可重试状态码直接流式转发但仍记失败、`has_next` 用 `is_available` 快照及其并发等价性、`AttemptGuard` drop 归还许可、`retry_canceled_requests` 保持默认 `true` 的理由；§5.4 `response_head_timeout` / `idle_timeout` 标"已实施"，`IdleTimeoutBody` 同时用于流式回传与缓冲错误 body，错误表更新 `NoUpstream` / `BadGateway` 触发点；§9 目录补 `idle.rs`，dev `tokio` 加 `test-util`；§11 T6/T7/T8/T12 按实际测试改写（T8 拆成跳过与探测两个测试，T12 补流式中途断开），记录新增三个测试文件与 EOF 观察基建；§12 R3 标"已实施"并写入提交、验收结果与变异验证 |
 | v3.1 | 2026-09-29 | 按 R1/R2 实施结果同步（对照 `src-tauri/crates/cc-proxy-core/` 代码与测试）：模块 `url.rs` 改名 `upstream_url.rs`（与外部 crate `url` 重名，§9、§12）；Gemini `/v1/models/{name}:{action}` 仅 `POST` 归 gemini，`GET` 含冒号的 OpenAI 微调模型 id 按 `/v1/models/{id}` 分流（§3）；入站服务改为 hyper `service_fn` 直接调用 `Relay::handle`，不用 axum / tower，路由全在 `interface::identify`（§3、§9）；§5.1 顺序改为鉴权 → 识别接口 → 读 body，R2 单上游版本与错误码落点；中转自身错误 `type` 统一 `relay_` 前缀并列表（§3、§5.4）；`/_relay/*` R2 一律 404、`/_relay/health` R4 实现（§8）；`connect_timeout` 已实施、`response_head` / `idle` 超时与 `retry_canceled_requests` 取舍归 R3（§5.2、§5.4）；§5.6 出站代理各条标"已实施"，显式端口由 `upstream_url` 单测覆盖；§4 `UpstreamConfig` 字段按实际类型（`Secret`、`Option<AuthScheme>`、`Option<String>`）；§9.1 依赖表按 core 实际 `Cargo.toml` 重写（补 `base64`、`percent-encoding`、`http-body`、`cc-switch-domain`，dev 依赖 `httparse`、`tokio-rustls`、`tokio`；删 `axum`、`tower`、`futures-util`、`rustls-pki-types`、`async-trait`，`toml`/`clap`/`tracing-subscriber` 归 R5）；T15 改用 `tests/fixtures/tls/` 预生成证书、不引入 `rcgen`（§11）；§11 记录测试基建与 27 个集成测试；§12 R1、R2 标"已实施"并写入 R2 验收结果（27 集成测试 + workspace 3200 通过 / 0 失败 / 9 忽略）与变异验证 |
