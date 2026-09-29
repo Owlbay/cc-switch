@@ -1,0 +1,21 @@
+[package]
+name = "cc-proxy-convert"
+version = "0.1.0"
+description = "Protocol conversion for the CC Switch relay through a shared intermediate representation"
+authors = ["Jason Young"]
+license = "MIT"
+repository = "https://github.com/farion1231/cc-switch"
+edition = "2021"
+rust-version = "1.85.0"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+cc-proxy-core = { path = "../cc-proxy-core" }
+http = "1"
+serde = { version = "1.0", features = ["derive"] }
+# preserve_order：工具参数等对象在转换后保持客户端给出的键序，输出跨轮稳定
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tracing = "0.1"
+
