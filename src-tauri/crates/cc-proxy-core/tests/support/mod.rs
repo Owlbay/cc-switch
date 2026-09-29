@@ -80,6 +80,8 @@ impl Segment {
 pub struct MockUpstream {
     pub addr: SocketAddr,
     requests: mpsc::UnboundedReceiver<RecordedRequest>,
+    /// 等待写出下一段响应期间观察到对端关闭连接
+    closed: mpsc::UnboundedReceiver<()>,
 }
 
 impl MockUpstream {
@@ -100,28 +102,34 @@ impl MockUpstream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 let tx = tx.clone();
+                let closed_tx = closed_tx.clone();
                 let response = response.clone();
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     match acceptor {
-                        None => handle_upstream_connection(stream, tx, response).await,
+                        None => handle_upstream_connection(stream, tx, closed_tx, response).await,
                         Some(acceptor) => {
                             // 握手失败（客户端不信任证书）时直接结束
                             if let Ok(tls) = acceptor.accept(stream).await {
-                                handle_upstream_connection(tls, tx, response).await;
+                                handle_upstream_connection(tls, tx, closed_tx, response).await;
                             }
                         }
                     }
                 });
             }
         });
-        Self { addr, requests: rx }
+        Self {
+            addr,
+            requests: rx,
+            closed: closed_rx,
+        }
     }
 
     pub fn base_url(&self) -> String {
@@ -134,6 +142,14 @@ impl MockUpstream {
             .await
             .expect("upstream did not receive a request in time")
             .expect("upstream channel closed")
+    }
+
+    /// 等待对端（中转）关闭连接，返回是否在 `within` 内观察到
+    pub async fn closed_within(&mut self, within: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(within, self.closed.recv()).await,
+            Ok(Some(()))
+        )
     }
 
     /// 在给定时间内没有收到请求
@@ -150,6 +166,7 @@ impl MockUpstream {
 async fn handle_upstream_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     tx: mpsc::UnboundedSender<RecordedRequest>,
+    closed_tx: mpsc::UnboundedSender<()>,
     response: Vec<Segment>,
 ) {
     let Some(request) = read_request(&mut stream).await else {
@@ -158,7 +175,22 @@ async fn handle_upstream_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let _ = tx.send(request);
     for segment in response {
         if !segment.delay.is_zero() {
-            tokio::time::sleep(segment.delay).await;
+            // 等待期间同时读 socket：读到 EOF 或出错说明对端（中转）已关闭连接
+            let sleep = tokio::time::sleep(segment.delay);
+            tokio::pin!(sleep);
+            let mut scratch = [0u8; 1024];
+            loop {
+                tokio::select! {
+                    () = &mut sleep => break,
+                    read = stream.read(&mut scratch) => match read {
+                        Ok(0) | Err(_) => {
+                            let _ = closed_tx.send(());
+                            return;
+                        }
+                        Ok(_) => {}
+                    },
+                }
+            }
         }
         if stream.write_all(&segment.bytes).await.is_err() {
             return;
