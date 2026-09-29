@@ -32,16 +32,26 @@ pub fn report(relay: &Relay) -> String {
             let uri = upstream_uri(
                 &upstream.base_url,
                 upstream.strip_prefix.as_deref(),
-                sample_path(interface),
+                sample_path(upstream.protocol),
                 None,
             );
+            let convert = if upstream.converts {
+                format!(
+                    " convert={}->{}",
+                    interface.as_str(),
+                    upstream.protocol.as_str()
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "  {} -> {}  auth={} via={}",
+                "  {} -> {}  auth={} via={}{}",
                 upstream.id,
                 mask_query_values(&uri),
                 auth_label(upstream.auth),
-                upstream.client.kind()
+                upstream.client.kind(),
+                convert
             );
         }
     }

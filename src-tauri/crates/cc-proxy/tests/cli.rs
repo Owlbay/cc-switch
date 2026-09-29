@@ -109,6 +109,12 @@ fn example_config_passes_check() {
     for id in ["anthropic", "openai", "deepseek", "google"] {
         assert!(stdout.contains(&format!("  {id} -> ")), "{stdout}");
     }
+    assert!(
+        stdout.contains(
+            "  deepseek-for-claude -> https://api.deepseek.com:443/v1/chat/completions  auth=bearer via=direct convert=claude->openai_chat"
+        ),
+        "{stdout}"
+    );
 }
 
 #[test]

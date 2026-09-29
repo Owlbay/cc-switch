@@ -40,6 +40,17 @@ base_url = "https://api.anthropic.com"
 api_key = "${ANTHROPIC_API_KEY}"
 # auth = "bearer"                 # 部分 Anthropic 兼容上游要求 Bearer；默认 x-api-key
 
+# 协议转换：Claude 客户端的请求转成 OpenAI Chat 发给该上游，响应再转回 Anthropic 格式。
+# 只处理 POST /v1/messages；count_tokens 等其他端点会跳过它，交给后面的透传上游。
+[[upstreams.claude]]
+id = "deepseek-for-claude"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+protocol = "openai_chat"          # 上游协议；缺省与所在接口相同，即纯透传
+default_max_output_tokens = 8192  # 客户端未给 max_tokens 时使用
+[upstreams.claude.model_map]      # 客户端模型名 -> 上游模型名，"*" 兜底
+"*" = "deepseek-chat"
+
 [[upstreams.openai_responses]]
 id = "openai"
 base_url = "https://api.openai.com"

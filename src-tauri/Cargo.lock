@@ -766,6 +766,7 @@ dependencies = [
 name = "cc-proxy"
 version = "0.1.0"
 dependencies = [
+ "cc-proxy-convert",
  "cc-proxy-core",
  "clap",
  "http",

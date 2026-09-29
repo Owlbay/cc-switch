@@ -71,6 +71,11 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(PathBuf, RelayConfig), Stri
     Ok((path, config))
 }
 
+/// 构造带协议转换器的 Relay；转换方向由各上游的 `protocol` 决定
+fn new_relay(config: &RelayConfig) -> Result<Relay, cc_proxy_core::upstream::BuildError> {
+    Relay::with_converter(config, Arc::new(cc_proxy_convert::IrConverter))
+}
+
 fn run_check(explicit: Option<PathBuf>) -> ExitCode {
     // 报告写 stdout；core 在加载证书等环节的告警写 stderr
     init_logging("warn");
@@ -84,7 +89,7 @@ fn run_check(explicit: Option<PathBuf>) -> ExitCode {
     if let Some(warning) = check::permission_warning(&path) {
         eprintln!("warning: {warning}");
     }
-    let relay = match Relay::new(&config) {
+    let relay = match new_relay(&config) {
         Ok(relay) => relay,
         Err(error) => {
             eprintln!("error: 配置 {} 无效:\n{error}", path.display());
@@ -136,8 +141,8 @@ fn run_serve(explicit: Option<PathBuf>, listen: Option<SocketAddr>, grace: Durat
     if let Some(warning) = check::permission_warning(&path) {
         tracing::warn!("{warning}");
     }
-    // Relay::new 会重新校验（包括 --listen 覆盖后的匿名规则）
-    let relay = match Relay::new(&config) {
+    // new_relay 会重新校验（包括 --listen 覆盖后的匿名规则）
+    let relay = match new_relay(&config) {
         Ok(relay) => Arc::new(relay),
         Err(error) => {
             tracing::error!("配置 {} 无效:\n{error}", path.display());
