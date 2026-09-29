@@ -9,6 +9,7 @@ pub mod access_log;
 pub mod auth;
 pub mod breaker;
 pub mod config;
+pub mod convert;
 pub mod error;
 pub mod forward;
 pub mod headers;

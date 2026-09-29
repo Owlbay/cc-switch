@@ -22,6 +22,12 @@ pub enum RelayErrorKind {
     NoUpstream,
     BadGateway,
     Internal,
+    /// 所有候选上游都无法用目标协议表达该请求
+    ConversionUnsupported,
+    /// 转换器内部错误
+    ConversionInternal,
+    /// 响应阶段转换失败（上游 body 无法解析、被压缩等）
+    ConversionFailed,
 }
 
 impl RelayErrorKind {
@@ -34,6 +40,9 @@ impl RelayErrorKind {
             Self::NoUpstream => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadGateway => StatusCode::BAD_GATEWAY,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ConversionUnsupported => StatusCode::BAD_REQUEST,
+            Self::ConversionInternal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ConversionFailed => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -46,6 +55,8 @@ impl RelayErrorKind {
             Self::NoUpstream => "relay_no_upstream",
             Self::BadGateway => "relay_bad_gateway",
             Self::Internal => "relay_internal_error",
+            Self::ConversionUnsupported => "relay_conversion_unsupported",
+            Self::ConversionInternal | Self::ConversionFailed => "relay_conversion_error",
         }
     }
 }
@@ -93,5 +104,8 @@ mod tests {
         assert_eq!(RelayErrorKind::BadRequest.status(), 400);
         assert_eq!(RelayErrorKind::BadGateway.status(), 502);
         assert_eq!(RelayErrorKind::Internal.status(), 500);
+        assert_eq!(RelayErrorKind::ConversionUnsupported.status(), 400);
+        assert_eq!(RelayErrorKind::ConversionInternal.status(), 500);
+        assert_eq!(RelayErrorKind::ConversionFailed.status(), 502);
     }
 }
