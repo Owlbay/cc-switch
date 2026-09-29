@@ -1,17 +1,22 @@
 //! 请求转发（设计文档 §5）。
 //!
-//! 流程：入站鉴权 → 识别接口 → 读取完整 body → 选上游 → 按透传边界重建请求 → 发送 →
-//! 把上游响应原样流回。整个流程在同一个 future 内完成，**不 `tokio::spawn`**：客户端断开时
-//! hyper 会 drop 这个 future，上游请求随之取消。
+//! 流程：入站鉴权 → 识别接口 → 读取完整 body → 按顺序尝试上游（熔断、故障转移，§5.2）→
+//! 按透传边界重建请求 → 发送 → 把上游响应原样流回。整个流程在同一个 future 内完成，
+//! **不 `tokio::spawn`**：客户端断开时 hyper 会 drop 这个 future，上游请求随之取消。
+//!
+//! 提交点是 `handle` 返回 `Response` 的那一刻：之前的失败都可以换上游重发同一请求，
+//! 之后上游中断只会中断客户端连接，不再重试。
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{HeaderValue, Request, Response, Uri, Version};
+use http::{HeaderValue, Method, Request, Response, Uri, Version};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 
 use crate::auth::{AuthDecision, InboundAuth};
+use crate::breaker::{CircuitBreaker, Permit};
 use crate::config::RelayConfig;
 use crate::error::{relay_error, BoxError, RelayBody, RelayErrorKind};
 use crate::headers::{client_response_headers, upstream_auth_header, upstream_request_headers};
@@ -25,6 +30,10 @@ pub struct Relay {
     upstreams: UpstreamSet,
     max_body_bytes: usize,
     preserve_header_case: bool,
+    response_head_timeout: Duration,
+    retry_on_status: Vec<u16>,
+    retry_body_bytes: usize,
+    max_attempts: Option<usize>,
 }
 
 impl Relay {
@@ -36,6 +45,11 @@ impl Relay {
             upstreams,
             max_body_bytes: usize::try_from(config.server.max_body_bytes).unwrap_or(usize::MAX),
             preserve_header_case: config.server.preserve_header_case,
+            response_head_timeout: Duration::from_secs(config.timeouts.response_head_secs),
+            retry_on_status: config.failover.retry_on_status.clone(),
+            retry_body_bytes: usize::try_from(config.failover.retry_body_bytes)
+                .unwrap_or(usize::MAX),
+            max_attempts: config.failover.max_attempts,
         })
     }
 
@@ -93,40 +107,136 @@ impl Relay {
             }
         };
 
-        let Some(upstream) = self.upstreams.for_interface(interface).first() else {
+        let candidates = self.upstreams.for_interface(interface);
+        if candidates.is_empty() {
             return relay_error(
                 RelayErrorKind::NoUpstream,
                 format!("no upstream configured for {}", interface.as_str()),
             );
-        };
+        }
 
+        // Responses 的按 id 读取 / 删除引用上游私有状态，换上游只会得到别家的 404
+        let max_attempts = if is_stateful_responses_call(interface, &parts.method, &path) {
+            1
+        } else {
+            self.max_attempts
+                .unwrap_or(candidates.len())
+                .min(candidates.len())
+        };
         let extensions = std::mem::take(&mut parts.extensions);
-        let request = match build_upstream_request(
-            upstream,
-            &parts,
-            &path,
-            query.as_deref(),
-            body,
-            self.preserve_header_case.then_some(extensions),
-        ) {
-            Ok(request) => request,
-            Err(message) => return relay_error(RelayErrorKind::Internal, message),
-        };
+        let mut attempts = 0;
+        let mut last = LastFailure::default();
 
-        match upstream.client.request(request).await {
-            Ok(response) => relay_response(response, self.preserve_header_case),
-            Err(error) => {
-                tracing::warn!(
-                    upstream = %upstream.id,
-                    interface = interface.as_str(),
-                    error = %error,
-                    "上游请求失败"
-                );
-                relay_error(
-                    RelayErrorKind::BadGateway,
-                    format!("upstream {} request failed", upstream.id),
-                )
+        for (index, upstream) in candidates.iter().enumerate() {
+            if attempts >= max_attempts {
+                break;
             }
+            let Some(permit) = upstream.breaker.try_acquire(Instant::now()) else {
+                continue;
+            };
+            let attempt = AttemptGuard::new(&upstream.breaker, permit);
+            attempts += 1;
+
+            let request = match build_upstream_request(
+                upstream,
+                &parts,
+                &path,
+                query.as_deref(),
+                body.clone(),
+                self.preserve_header_case.then(|| extensions.clone()),
+            ) {
+                Ok(request) => request,
+                Err(message) => return relay_error(RelayErrorKind::Internal, message),
+            };
+
+            let response = match tokio::time::timeout(
+                self.response_head_timeout,
+                upstream.client.request(request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    attempt.failure();
+                    tracing::warn!(
+                        upstream = %upstream.id,
+                        interface = interface.as_str(),
+                        attempt = attempts,
+                        error = %error,
+                        "上游请求失败"
+                    );
+                    last.error = Some(format!("upstream {} request failed", upstream.id));
+                    continue;
+                }
+                Err(_elapsed) => {
+                    attempt.failure();
+                    tracing::warn!(
+                        upstream = %upstream.id,
+                        interface = interface.as_str(),
+                        attempt = attempts,
+                        "等待上游响应头超时"
+                    );
+                    last.error = Some(format!(
+                        "upstream {} did not respond within {}s",
+                        upstream.id,
+                        self.response_head_timeout.as_secs()
+                    ));
+                    continue;
+                }
+            };
+
+            if !self.retry_on_status.contains(&response.status().as_u16()) {
+                attempt.success();
+                return relay_response(response, self.preserve_header_case);
+            }
+
+            attempt.failure();
+            tracing::warn!(
+                upstream = %upstream.id,
+                interface = interface.as_str(),
+                attempt = attempts,
+                status = response.status().as_u16(),
+                "上游返回可重试状态码"
+            );
+            let has_next = attempts < max_attempts
+                && candidates[index + 1..]
+                    .iter()
+                    .any(|next| next.breaker.is_available(Instant::now()));
+            if !has_next {
+                // 已是最后一次可能的尝试：原样流式转发，不缓冲、不截断
+                return relay_response(response, self.preserve_header_case);
+            }
+            match buffer_response(
+                response,
+                self.retry_body_bytes,
+                self.preserve_header_case,
+                &upstream.id,
+            )
+            .await
+            {
+                Ok(buffered) => last.response = Some(buffered),
+                Err(message) => last.error = Some(message),
+            }
+        }
+
+        // 全部失败：优先回放最近一次完整缓冲的上游响应（保留其状态码、retry-after 等），
+        // 没有可回放的响应时才返回中转自身的 502；一次都没尝试（全部熔断）返回 503。
+        match last {
+            LastFailure {
+                response: Some(response),
+                ..
+            } => response,
+            LastFailure {
+                error: Some(message),
+                ..
+            } => relay_error(RelayErrorKind::BadGateway, message),
+            LastFailure { .. } => relay_error(
+                RelayErrorKind::NoUpstream,
+                format!(
+                    "all upstreams for {} are unavailable (circuit open)",
+                    interface.as_str()
+                ),
+            ),
         }
     }
 
@@ -188,4 +298,144 @@ fn relay_response(
         *out.extensions_mut() = std::mem::take(&mut parts.extensions);
     }
     out
+}
+
+/// `GET` / `DELETE /v1/responses/{id}` 读取或删除上游保存的响应，只能发给同一个上游。
+fn is_stateful_responses_call(interface: Interface, method: &Method, path: &str) -> bool {
+    interface == Interface::OpenaiResponses
+        && (method == Method::GET || method == Method::DELETE)
+        && path.starts_with("/v1/responses/")
+}
+
+/// 尝试循环中记录的失败
+#[derive(Default)]
+struct LastFailure {
+    /// 最近一次完整缓冲的可重试响应，全部失败时原样回放
+    response: Option<Response<RelayBody>>,
+    /// 最近一次网络错误、超时，或可重试响应的 body 超过缓冲上限
+    error: Option<String>,
+}
+
+/// 缓冲一个可重试响应（最多 `limit` 字节），用于全部上游失败时回放。
+async fn buffer_response(
+    response: Response<hyper::body::Incoming>,
+    limit: usize,
+    preserve_header_case: bool,
+    upstream_id: &str,
+) -> Result<Response<RelayBody>, String> {
+    let (mut parts, body) = response.into_parts();
+    let bytes = match Limited::new(body, limit).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) if error.is::<LengthLimitError>() => {
+            return Err(format!(
+                "upstream {upstream_id} failed and its error body exceeds {limit} bytes"
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "upstream {upstream_id} failed while sending its error body"
+            ));
+        }
+    };
+    let mut out = Response::new(crate::error::full(bytes));
+    *out.status_mut() = parts.status;
+    *out.headers_mut() = client_response_headers(&parts.headers);
+    if preserve_header_case {
+        *out.extensions_mut() = std::mem::take(&mut parts.extensions);
+    }
+    Ok(out)
+}
+
+/// 一次尝试占用的熔断许可。结果确定时调用 `success` / `failure`；
+/// 未确定就被 drop（例如客户端断开导致 future 被取消）时归还许可，不计成功也不计失败。
+struct AttemptGuard<'a> {
+    breaker: &'a CircuitBreaker,
+    permit: Option<Permit>,
+}
+
+impl<'a> AttemptGuard<'a> {
+    fn new(breaker: &'a CircuitBreaker, permit: Permit) -> Self {
+        Self {
+            breaker,
+            permit: Some(permit),
+        }
+    }
+
+    fn success(mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.breaker.record_success(permit);
+        }
+    }
+
+    fn failure(mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.breaker.record_failure(permit, Instant::now());
+        }
+    }
+}
+
+impl Drop for AttemptGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.breaker.release(permit);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::breaker::BreakerState;
+
+    #[test]
+    fn stateful_responses_calls() {
+        let r = Interface::OpenaiResponses;
+        assert!(is_stateful_responses_call(
+            r,
+            &Method::GET,
+            "/v1/responses/resp_1"
+        ));
+        assert!(is_stateful_responses_call(
+            r,
+            &Method::DELETE,
+            "/v1/responses/resp_1"
+        ));
+        assert!(!is_stateful_responses_call(
+            r,
+            &Method::POST,
+            "/v1/responses"
+        ));
+        assert!(!is_stateful_responses_call(
+            r,
+            &Method::POST,
+            "/v1/responses/compact"
+        ));
+        assert!(!is_stateful_responses_call(
+            Interface::Claude,
+            &Method::GET,
+            "/v1/responses/x"
+        ));
+    }
+
+    #[test]
+    fn dropped_guard_returns_probe_slot() {
+        let breaker = CircuitBreaker::new(1, Duration::from_secs(60));
+        let t0 = Instant::now();
+        let permit = breaker.try_acquire(t0).unwrap();
+        AttemptGuard::new(&breaker, permit).failure();
+        assert_eq!(breaker.state(t0), BreakerState::Open);
+
+        // failure() 用真实时钟记录打开时间，这里以当前时间为基准越过打开期
+        let t1 = Instant::now() + Duration::from_secs(61);
+        let probe = breaker.try_acquire(t1).unwrap();
+        drop(AttemptGuard::new(&breaker, probe));
+        assert!(
+            breaker.is_available(t1),
+            "probe slot must be released on drop"
+        );
+
+        let probe = breaker.try_acquire(t1).unwrap();
+        AttemptGuard::new(&breaker, probe).success();
+        assert_eq!(breaker.state(t1), BreakerState::Closed);
+    }
 }

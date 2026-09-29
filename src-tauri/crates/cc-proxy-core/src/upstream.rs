@@ -20,6 +20,7 @@ use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
 use url::Url;
 
+use crate::breaker::CircuitBreaker;
 use crate::config::{validate_base_url, validate_proxy_url, AuthScheme, RelayConfig, Secret};
 use crate::interface::Interface;
 use crate::tls::{self, TlsError};
@@ -200,6 +201,8 @@ pub struct ResolvedUpstream {
     pub auth: AuthScheme,
     pub api_key: Secret,
     pub client: Arc<UpstreamClient>,
+    /// 按上游计数的熔断器（§5.5）
+    pub breaker: CircuitBreaker,
 }
 
 /// 按接口分组的上游列表（保持配置顺序）
@@ -247,6 +250,7 @@ impl UpstreamSet {
                     auth: upstream.auth_scheme(interface),
                     api_key: upstream.api_key.clone(),
                     client,
+                    breaker: CircuitBreaker::from_config(&config.breaker),
                 }));
             }
             by_interface.insert(interface, resolved);

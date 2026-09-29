@@ -79,6 +79,17 @@ impl CircuitBreaker {
         inner.state
     }
 
+    /// 此刻 `try_acquire` 是否会放行（不占用许可，只用于判断是否还有后续上游可试）。
+    pub fn is_available(&self, now: Instant) -> bool {
+        let mut inner = self.lock();
+        self.refresh(&mut inner, now);
+        match inner.state {
+            BreakerState::Closed => true,
+            BreakerState::HalfOpen => !inner.probe_in_flight,
+            BreakerState::Open => false,
+        }
+    }
+
     /// 请求放行：`closed` 总是放行；`half_open` 只放行一个探测；`open` 拒绝。
     pub fn try_acquire(&self, now: Instant) -> Option<Permit> {
         let mut inner = self.lock();
@@ -280,6 +291,23 @@ mod tests {
             .filter_map(|h| h.join().unwrap())
             .collect();
         assert_eq!(granted, vec![Permit::Probe]);
+    }
+
+    #[test]
+    fn availability_matches_acquire_without_taking_a_permit() {
+        let b = breaker();
+        let t0 = Instant::now();
+        assert!(b.is_available(t0));
+        for _ in 0..3 {
+            fail(&b, t0);
+        }
+        assert!(!b.is_available(t0));
+        let t1 = t0 + OPEN;
+        assert!(b.is_available(t1));
+        assert!(b.is_available(t1), "checking must not consume the probe");
+        let probe = b.try_acquire(t1).unwrap();
+        assert!(!b.is_available(t1));
+        b.release(probe);
     }
 
     #[test]
