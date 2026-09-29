@@ -761,6 +761,10 @@ name = "cc-proxy-core"
 version = "0.1.0"
 dependencies = [
  "cc-switch-domain",
+ "http",
+ "serde",
+ "serde_json",
+ "url",
 ]
 
 [[package]]

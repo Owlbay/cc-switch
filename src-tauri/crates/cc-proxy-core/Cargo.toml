@@ -16,3 +16,9 @@ test-util = ["cc-switch-domain/test-util"]
 
 [dependencies]
 cc-switch-domain = { path = "../cc-switch-domain" }
+http = "1"
+serde = { version = "1.0", features = ["derive"] }
+url = "2.5"
+
+[dev-dependencies]
+serde_json = "1.0"

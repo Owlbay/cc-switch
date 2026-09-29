@@ -1,5 +1,11 @@
-//! CC Switch 本地代理引擎。
+//! CC Switch 模型接口透传中转引擎。
 //!
-//! 目标是不依赖 Tauri / SQLite：桌面 app 与独立程序 `cc-proxy` 通过宿主 trait 注入
-//! 存储、事件与凭据。拆分计划见 `docs/standalone-proxy-core-design-zh.md`
-//! （P2 原地解耦，P3 迁入 `src-tauri/src/proxy`）。
+//! 把 Anthropic Messages、OpenAI Chat Completions、OpenAI Responses、Gemini 四个接口的
+//! 请求原样转发给配置的上游，并把响应原样流回。core 不修改任何语义内容；需要改写时
+//! 由独立的拦截器组件接入。不依赖 Tauri / SQLite。
+//! 设计见 `docs/passthrough-relay-design-zh.md`。
+
+pub mod interface;
+pub mod upstream_url;
+
+pub use interface::{identify, Interface};
