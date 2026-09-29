@@ -1,0 +1,61 @@
+# cc-proxy 示例配置。复制到 ~/.cc-proxy/config.toml 后修改，并 chmod 600。
+# 字符串中的 ${VAR} 在加载时从环境变量展开（未定义会报错），$${ 表示字面量 ${。
+# 用法见 docs/cc-proxy-usage-zh.md；修改后可先运行 `cc-proxy check` 校验。
+
+[server]
+listen = "127.0.0.1:15721"
+# 客户端访问中转用的 token（不是上游 Key），可配置多个
+auth_tokens = ["${CC_PROXY_TOKEN}"]
+# 不配置 token 时必须显式开启匿名访问，且只能监听回环地址；风险见使用说明
+# allow_anonymous = false
+max_body_bytes = 209715200        # 200 MiB
+preserve_header_case = true       # 保留请求头名的原始大小写
+# 全局出站代理（http / https / socks5 / socks5h），可被单个上游覆盖
+# proxy_url = "socks5h://127.0.0.1:1080"
+
+[tls]
+native_roots = true               # 除内置根证书外加载系统证书
+# extra_ca_file = "/etc/ssl/corp-ca.pem"
+
+[timeouts]
+connect_secs = 10
+response_head_secs = 120          # 等待上游响应头的最长时间，超时换下一个上游
+idle_secs = 300                   # 流式响应中两次数据之间的最长间隔
+
+[failover]
+retry_on_status = [429, 500, 502, 503, 504, 529]
+retry_body_bytes = 1048576
+# max_attempts = 2                # 缺省为该接口的上游数量，每个上游最多尝试一次
+
+[breaker]
+failure_threshold = 5             # 连续失败次数达到后暂停使用该上游
+open_secs = 60                    # 暂停时长，之后放行一个探测请求
+
+# 每个接口一个有序上游列表，按顺序故障转移。
+# base_url 只写到服务根路径，不要带 /v1/messages 之类的端点路径。
+
+[[upstreams.claude]]
+id = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+# auth = "bearer"                 # 部分 Anthropic 兼容上游要求 Bearer；默认 x-api-key
+
+[[upstreams.openai_responses]]
+id = "openai"
+base_url = "https://api.openai.com"
+api_key = "${OPENAI_API_KEY}"
+# proxy_url = "http://127.0.0.1:7890"
+
+[[upstreams.openai_chat]]
+id = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+# base_url 已含版本段的上游用 strip_prefix 去掉入站的 /v1，例如：
+# base_url = "https://ark.cn-beijing.volces.com/api/v3"
+# strip_prefix = "/v1"
+# proxy_url = ""                  # 空字符串：该上游不走全局代理
+
+[[upstreams.gemini]]
+id = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "${GEMINI_API_KEY}"

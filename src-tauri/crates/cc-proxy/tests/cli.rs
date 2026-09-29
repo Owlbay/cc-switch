@@ -91,6 +91,26 @@ proxy_url = "socks5h://127.0.0.1:1080"
     assert!(stderr.is_empty(), "600 config must not warn: {stderr}");
 }
 
+/// 示例配置必须始终能通过 check（防止文档与实现脱节）
+#[test]
+fn example_config_passes_check() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+    let path = write_config(&std::fs::read_to_string(example).unwrap());
+    let out = run(bin()
+        .args(["check", "--config"])
+        .arg(&path)
+        .env("CC_PROXY_TOKEN", RELAY_TOKEN)
+        .env("ANTHROPIC_API_KEY", UPSTREAM_KEY)
+        .env("OPENAI_API_KEY", UPSTREAM_KEY)
+        .env("DEEPSEEK_API_KEY", UPSTREAM_KEY)
+        .env("GEMINI_API_KEY", UPSTREAM_KEY));
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    for id in ["anthropic", "openai", "deepseek", "google"] {
+        assert!(stdout.contains(&format!("  {id} -> ")), "{stdout}");
+    }
+}
+
 #[test]
 fn check_reports_undefined_variable_by_location() {
     let path = write_config(
