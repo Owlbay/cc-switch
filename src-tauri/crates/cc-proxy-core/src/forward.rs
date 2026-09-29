@@ -15,6 +15,7 @@ use http::{HeaderValue, Method, Request, Response, Uri, Version};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 
+use crate::access_log::AccessLog;
 use crate::auth::{AuthDecision, InboundAuth};
 use crate::breaker::{CircuitBreaker, Permit};
 use crate::config::RelayConfig;
@@ -60,8 +61,23 @@ impl Relay {
         self.preserve_header_case
     }
 
-    /// 处理一个入站请求。
+    /// 处理一个入站请求，并为它写出恰好一行访问日志（§8）。
     pub async fn handle<B>(&self, request: Request<B>) -> Response<RelayBody>
+    where
+        B: Body<Data = Bytes>,
+        B::Error: Into<BoxError>,
+    {
+        // 在 dispatch 完成前被 drop（客户端断开）时，AccessLog 自己记为 cancelled
+        let mut log = AccessLog::new(request.method(), request.uri().path());
+        let response = self.dispatch(request, &mut log).await;
+        if log.is_streaming() {
+            log.stream(response)
+        } else {
+            log.finish(response)
+        }
+    }
+
+    async fn dispatch<B>(&self, request: Request<B>, log: &mut AccessLog) -> Response<RelayBody>
     where
         B: Body<Data = Bytes>,
         B::Error: Into<BoxError>,
@@ -83,7 +99,10 @@ impl Relay {
                 );
             }
             AuthDecision::Anonymous if parts.headers.contains_key(http::header::ORIGIN) => {
-                tracing::warn!("匿名模式下收到带 Origin 头的请求，可能来自浏览器页面");
+                tracing::warn!(
+                    request_id = %log.request_id(),
+                    "匿名模式下收到带 Origin 头的请求，可能来自浏览器页面"
+                );
             }
             AuthDecision::Allowed | AuthDecision::Anonymous => {}
         }
@@ -94,6 +113,7 @@ impl Relay {
                 format!("{} {path} is not a relayed interface", parts.method),
             );
         };
+        log.set_interface(interface);
 
         let body = match Limited::new(body, self.max_body_bytes).collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -107,6 +127,8 @@ impl Relay {
                 return relay_error(RelayErrorKind::BadRequest, "failed to read request body");
             }
         };
+
+        log.set_request_bytes(body.len());
 
         let candidates = self.upstreams.for_interface(interface);
         if candidates.is_empty() {
@@ -137,6 +159,7 @@ impl Relay {
             };
             let attempt = AttemptGuard::new(&upstream.breaker, permit);
             attempts += 1;
+            log.start_attempt(&upstream.id);
 
             let request = match build_upstream_request(
                 upstream,
@@ -156,10 +179,14 @@ impl Relay {
             )
             .await
             {
-                Ok(Ok(response)) => response,
+                Ok(Ok(response)) => {
+                    log.head_received();
+                    response
+                }
                 Ok(Err(error)) => {
                     attempt.failure();
                     tracing::warn!(
+                        request_id = %log.request_id(),
                         upstream = %upstream.id,
                         interface = interface.as_str(),
                         attempt = attempts,
@@ -172,6 +199,7 @@ impl Relay {
                 Err(_elapsed) => {
                     attempt.failure();
                     tracing::warn!(
+                        request_id = %log.request_id(),
                         upstream = %upstream.id,
                         interface = interface.as_str(),
                         attempt = attempts,
@@ -188,11 +216,13 @@ impl Relay {
 
             if !self.retry_on_status.contains(&response.status().as_u16()) {
                 attempt.success();
+                log.set_streaming();
                 return relay_response(response, self.preserve_header_case, self.idle_timeout);
             }
 
             attempt.failure();
             tracing::warn!(
+                request_id = %log.request_id(),
                 upstream = %upstream.id,
                 interface = interface.as_str(),
                 attempt = attempts,
@@ -207,6 +237,7 @@ impl Relay {
                     .any(|next| next.breaker.is_available(Instant::now()));
             if !has_next {
                 // 已是最后一次可能的尝试：原样流式转发，不缓冲、不截断
+                log.set_streaming();
                 return relay_response(response, self.preserve_header_case, self.idle_timeout);
             }
             match buffer_response(

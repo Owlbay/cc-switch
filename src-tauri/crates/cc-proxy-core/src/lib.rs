@@ -5,6 +5,7 @@
 //! 由独立的拦截器组件接入。不依赖 Tauri / SQLite。
 //! 设计见 `docs/passthrough-relay-design-zh.md`。
 
+pub mod access_log;
 pub mod auth;
 pub mod breaker;
 pub mod config;
