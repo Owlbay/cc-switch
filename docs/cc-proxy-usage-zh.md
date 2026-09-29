@@ -49,7 +49,7 @@ export CC_PROXY_TOKEN=... ANTHROPIC_API_KEY=... # 以及配置中引用的其它
 cc-proxy check
 ```
 
-`check` 会加载并校验配置、加载 TLS 证书，然后逐个上游打印最终请求的 URL、鉴权方式和出站方式，不发任何请求，也不打印 Key；URL 中 query 参数只保留名字。配置有误时退出码为 2。
+`check` 会加载并校验配置、加载 TLS 证书，然后逐个上游打印最终请求的 URL、鉴权方式和出站方式，不发任何请求，也不打印 Key；URL 中 query 参数只保留名字。配置有误时退出码为 2。加载证书等环节的告警写到 stderr（默认只输出 warn 及以上）。
 
 ## 运行
 
@@ -60,7 +60,7 @@ cc-proxy serve --listen 127.0.0.1:0 # 随机端口
 
 - 启动成功后 stdout 只输出一行 `listening on ADDR`，便于脚本读取实际端口；日志全部写到 stderr。
 - 收到 Ctrl-C 或 SIGTERM 后停止接受新连接，等待进行中的请求（包括流式响应）结束，最长 `--grace-secs` 秒（默认 10）；期间再收到一次信号立即退出。
-- 退出码：配置错误 2，运行时错误（如端口被占用）1。
+- 退出码：正常退出 0；配置错误 2；运行时错误（如端口被占用）或强制退出（排空超时、再次收到信号，进行中的流可能被截断）1。
 - `GET /_relay/health` 返回 `{"status":"ok"}`，不需要 token，可用于探活。
 
 ## 客户端接入
@@ -135,6 +135,7 @@ INFO cc_proxy_core::access: relay request request_id=r-2 method=POST path=/v1/me
 - `outcome`：`complete` 完整发出；`error` 上游在响应中途出错或空闲超时；`aborted` 客户端在响应中途断开；`cancelled` 客户端在收到响应前断开。
 - 失败的尝试另有 warn 日志，带同一个 `request_id`。
 - 日志**不包含**请求 / 响应 body、Key、token 与 query。
+- `RUST_LOG` 写错时回退到默认级别并输出一条告警。
 - 用 `RUST_LOG` 调整级别，例如 `RUST_LOG=warn cc-proxy serve` 只看告警，`RUST_LOG=cc_proxy_core::access=info,warn` 只保留访问日志与告警。
 
 ## 限制

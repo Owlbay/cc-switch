@@ -60,8 +60,32 @@ pub fn parse(
         .try_into::<RelayConfig>()
         .map_err(|e| ConfigFileError::Parse {
             path: path.to_path_buf(),
-            message: e.to_string(),
+            message: redact_string_values(&e.to_string()),
         })
+}
+
+/// serde 的类型错误会回显字符串值（如 `invalid type: string "sk-…", expected u64`）；
+/// 这些值可能来自展开后的环境变量，报错时替换为 `***`。
+fn redact_string_values(message: &str) -> String {
+    const MARKER: &str = "string \"";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(pos) = rest.find(MARKER) {
+        out.push_str(&rest[..pos + MARKER.len()]);
+        let after = &rest[pos + MARKER.len()..];
+        match after.find('"') {
+            Some(end) => {
+                out.push_str("***\"");
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("***");
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 默认配置路径：显式参数 > `CC_PROXY_CONFIG` > `$HOME/.cc-proxy/config.toml`
@@ -289,6 +313,23 @@ api_key = "${GEMINI_API_KEY}"
 
         let err = parse("[server\n", Path::new("t.toml"), env(&[])).unwrap_err();
         assert!(matches!(err, ConfigFileError::Parse { .. }), "{err}");
+    }
+
+    #[test]
+    fn type_errors_do_not_echo_expanded_values() {
+        let err = parse(
+            "[server]\nmax_body_bytes = \"${BIG}\"\n",
+            Path::new("t.toml"),
+            env(&[("BIG", "sk-should-not-leak")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("sk-should-not-leak"), "{err}");
+        assert!(err.contains("string \"***\""), "{err}");
+        assert_eq!(
+            redact_string_values(r#"a string "x" and string "y" end"#),
+            r#"a string "***" and string "***" end"#
+        );
     }
 
     #[test]

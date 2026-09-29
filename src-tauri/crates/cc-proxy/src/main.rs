@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 
 /// 配置错误的退出码
 const EXIT_CONFIG: u8 = 2;
-/// 运行时错误（如端口绑定失败）的退出码
+/// 运行时错误（如端口绑定失败）或强制退出（排空超时、再次收到信号）的退出码
 const EXIT_RUNTIME: u8 = 1;
 
 #[derive(Parser)]
@@ -72,6 +72,8 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(PathBuf, RelayConfig), Stri
 }
 
 fn run_check(explicit: Option<PathBuf>) -> ExitCode {
+    // 报告写 stdout；core 在加载证书等环节的告警写 stderr
+    init_logging("warn");
     let (path, config) = match load_config(explicit) {
         Ok(loaded) => loaded,
         Err(message) => {
@@ -98,17 +100,29 @@ fn run_check(explicit: Option<PathBuf>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+/// 日志写到 stderr；`RUST_LOG` 未设置时使用 `default_level`，设置但语法错误时回退并告警
+fn init_logging(default_level: &str) {
+    let (filter, invalid) = match std::env::var("RUST_LOG") {
+        Ok(spec) if !spec.is_empty() => match tracing_subscriber::EnvFilter::try_new(&spec) {
+            Ok(filter) => (filter, None),
+            Err(error) => (
+                tracing_subscriber::EnvFilter::new(default_level),
+                Some(error.to_string()),
+            ),
+        },
+        _ => (tracing_subscriber::EnvFilter::new(default_level), None),
+    };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .init();
+    if let Some(error) = invalid {
+        tracing::warn!(%error, "RUST_LOG 无法解析，已回退到 {default_level}");
+    }
 }
 
 fn run_serve(explicit: Option<PathBuf>, listen: Option<SocketAddr>, grace: Duration) -> ExitCode {
-    init_logging();
+    init_logging("info");
     let (path, mut config) = match load_config(explicit) {
         Ok(loaded) => loaded,
         Err(message) => {
@@ -177,12 +191,21 @@ async fn serve_until_signal(relay: Arc<Relay>, listen: SocketAddr, grace: Durati
         }
         _ = signaled_rx => {}
     }
+    // 强制退出时可能截断了进行中的流，以非 0 退出码告知调用方
     tokio::select! {
-        () = &mut serving => tracing::info!("所有请求已结束，cc-proxy 已退出"),
-        () = tokio::time::sleep(grace) => tracing::warn!("等待超时，强制退出"),
-        () = wait_for_signal() => tracing::warn!("再次收到退出信号，立即退出"),
+        () = &mut serving => {
+            tracing::info!("所有请求已结束，cc-proxy 已退出");
+            ExitCode::SUCCESS
+        }
+        () = tokio::time::sleep(grace) => {
+            tracing::warn!("等待超时，强制退出");
+            ExitCode::from(EXIT_RUNTIME)
+        }
+        () = wait_for_signal() => {
+            tracing::warn!("再次收到退出信号，立即退出");
+            ExitCode::from(EXIT_RUNTIME)
+        }
     }
-    ExitCode::SUCCESS
 }
 
 /// 等待 Ctrl-C（SIGINT），unix 上同时等待 SIGTERM

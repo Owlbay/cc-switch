@@ -321,3 +321,69 @@ api_key = "${{E2E_KEY}}"
         assert!(!stderr.contains(secret), "log leaked {secret}:\n{stderr}");
     }
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn forced_exit_after_grace_returns_non_zero() {
+    let (upstream_url, _upstream) = start_upstream().await;
+    let path = write_config(&format!(
+        r#"
+[server]
+auth_tokens = ["{RELAY_TOKEN}"]
+
+[tls]
+native_roots = false
+
+[[upstreams.claude]]
+id = "mock"
+base_url = "{upstream_url}"
+api_key = "{UPSTREAM_KEY}"
+"#
+    ));
+    let mut child = bin()
+        .args([
+            "serve",
+            "--listen",
+            "127.0.0.1:0",
+            "--grace-secs",
+            "0",
+            "--config",
+        ])
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cc-proxy");
+    let addr = read_listen_addr(&mut child);
+    let mut guard = ChildGuard(child);
+
+    let mut client = TcpStream::connect(&addr).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: relay\r\nx-api-key: {RELAY_TOKEN}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !raw.windows(7).any(|w| w == b"data: 1") {
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        raw.extend_from_slice(&buf[..n]);
+    }
+    Command::new("kill")
+        .args(["-TERM", &guard.0.id().to_string()])
+        .status()
+        .unwrap();
+
+    let exit = tokio::task::spawn_blocking(move || guard.0.wait().unwrap());
+    let status = tokio::time::timeout(Duration::from_secs(10), exit)
+        .await
+        .expect("cc-proxy did not exit")
+        .unwrap();
+    // 排空期为 0：进行中的流被截断，退出码非 0
+    assert_eq!(status.code(), Some(1), "{status:?}");
+}
