@@ -760,12 +760,25 @@ dependencies = [
 name = "cc-proxy-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bytes",
  "cc-switch-domain",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

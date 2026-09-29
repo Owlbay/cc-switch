@@ -10,6 +10,8 @@ pub mod breaker;
 pub mod config;
 pub mod headers;
 pub mod interface;
+pub mod tls;
+pub mod upstream;
 pub mod upstream_url;
 
 pub use config::RelayConfig;
