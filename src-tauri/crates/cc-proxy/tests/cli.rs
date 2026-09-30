@@ -111,6 +111,12 @@ fn example_config_passes_check() {
     }
     assert!(
         stdout.contains(
+            "  anthropic-for-codex -> https://api.anthropic.com:443/v1/messages  auth=x-api-key via=direct convert=openai_responses->claude default_max_output_tokens=16384"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
             "  deepseek-for-claude -> https://api.deepseek.com:443/v1/chat/completions  auth=bearer via=direct convert=claude->openai_chat default_max_output_tokens=8192"
         ),
         "{stdout}"

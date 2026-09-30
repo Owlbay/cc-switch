@@ -57,6 +57,15 @@ base_url = "https://api.openai.com"
 api_key = "${OPENAI_API_KEY}"
 # proxy_url = "http://127.0.0.1:7890"
 
+# 协议转换：Codex CLI 的 Responses 请求转成 Anthropic Messages 发给该上游。
+# 推理签名会封装后带给 Codex，下一轮原样还原；有状态请求（previous_response_id）会跳过它。
+[[upstreams.openai_responses]]
+id = "anthropic-for-codex"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+protocol = "claude"
+model_map = { "*" = "claude-sonnet-4-5" }
+
 [[upstreams.openai_chat]]
 id = "deepseek"
 base_url = "https://api.deepseek.com"
