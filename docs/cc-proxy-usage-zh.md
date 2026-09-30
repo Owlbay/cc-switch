@@ -82,7 +82,7 @@ model_map = { "*" = "gemini-2.5-pro" }
 - **同协议 + `model_map`（恒等转换）**：只改请求与响应里的模型名，其余字段原样保留；但 body 会经 JSON 重新序列化，流式响应会重新成帧（SSE 注释行、`id:` / `retry:` 字段不保留）。不配 `model_map` 时仍逐字节透传。
 - **只转换主端点**：Claude 客户端只转换 `POST /v1/messages`，Codex 客户端只转换 `POST /v1/responses`。`count_tokens`、`/v1/models`、按 id 读取响应等端点在其他协议没有等价物，会跳过转换上游，交给同接口的透传上游；没有透传上游时返回 400 `relay_conversion_unsupported`。
 - **无法表达的请求不发给上游**：以下请求会跳过转换上游，所有上游都跳过时返回 400 `relay_conversion_unsupported`：Responses 的 `previous_response_id` / `conversation`（服务端状态无法在别的上游重建）、`n > 1`、`logprobs`、结构化输出（`text.format` 为 JSON schema）、PDF 等文档发给 Chat / Responses 上游、图片 URL 发给 Gemini 上游（Gemini 只接受内联图片）。
-- **可降级的内容静默处理**：`cache_control`、Codex 的 `store` / `include` / `prompt_cache_key` / `reasoning.summary` 等字段被忽略；Claude Code 默认携带的 WebSearch 工具发给 Chat 上游时被剔除，发给 Responses 上游时映射为内置 `web_search`，发给 Gemini 上游时映射为 `googleSearch`；Codex 的 `apply_patch`（custom 工具）会降级为参数 `{input}` 的函数工具，响应时再还原。
+- **可降级的内容静默处理**：`cache_control`、Codex 的 `store` / `include` / `prompt_cache_key` / `reasoning.summary` 等字段被忽略；Claude Code 默认携带的 WebSearch 工具发给 Chat 上游时被剔除，发给 Responses 上游时映射为内置 `web_search`，发给 Gemini 上游时只在请求没有函数工具时映射为 `googleSearch`，否则同样剔除（Gemini 2.x 不允许两者同时出现；Claude Code 总带函数工具，所以实际通常被剔除）；Codex 的 `apply_patch`（custom 工具）会降级为参数 `{input}` 的函数工具，响应时再还原。
 - **推理签名的往返**：上游返回的 thinking 签名、`encrypted_content`、Gemini `thoughtSignature` 会被封装成 `ccsw1.` 开头的字符串带给客户端，客户端下一轮原样带回时还原给同一种上游。签名无法回放时（换了协议不同的上游、或客户端没带回），发往 Anthropic 上游的请求会自动关闭 thinking，而不是报错。
 - **不要在同一会话里混用转换上游与同协议透传上游**：故障转移到透传上游时，客户端历史里的 `ccsw1.` 签名、或来自 Chat 上游的无签名 thinking 块，会被 Anthropic 等上游拒绝（400）。需要故障转移时，让备用上游也走同一种转换。
 - **Gemini 注意事项**：Gemini 2.5 Pro 不能关闭 thinking，客户端明确关闭 thinking 时该模型会返回 400；Gemini 3 要求回放 `thoughtSignature`，从别处带来的无签名历史可能被拒绝。
