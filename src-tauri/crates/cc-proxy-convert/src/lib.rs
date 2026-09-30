@@ -12,6 +12,7 @@ pub mod anthropic;
 pub mod chat;
 pub mod cross;
 pub mod envelope;
+pub mod gemini;
 pub mod ir;
 pub mod responses;
 pub mod responses_upstream;
