@@ -13,6 +13,7 @@ pub mod chat;
 pub mod envelope;
 pub mod ir;
 pub mod responses;
+pub mod responses_upstream;
 pub mod sse;
 
 use bytes::Bytes;
