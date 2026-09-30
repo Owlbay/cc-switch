@@ -669,6 +669,44 @@ fn tool_call_item(call_id: &str, name: &str, arguments: &str, custom: bool, stat
     }
 }
 
+/// web_search_call 项 id：`ws_` 前缀 + 原 id 去掉前缀后的主体（`srvtoolu_x` → `ws_x`）
+fn web_search_item_id(id: &str) -> String {
+    if id.starts_with("ws_") {
+        return id.to_string();
+    }
+    let body = id.split_once('_').map(|(_, rest)| rest).unwrap_or(id);
+    format!("ws_{body}")
+}
+
+/// server_tool_use 的 input → web_search_call 的 action：有 query 为 search，
+/// 有 pattern 为 find，只有 url 为 open_page
+fn web_search_action(input: &Value) -> Value {
+    let field = |key: &str| input.get(key).filter(|v| !v.is_null()).cloned();
+    if let Some(pattern) = field("pattern") {
+        let mut action = json!({ "type": "find", "pattern": pattern });
+        if let Some(url) = field("url") {
+            action["url"] = url;
+        }
+        return action;
+    }
+    if field("query").is_none() {
+        if let Some(url) = field("url") {
+            return json!({ "type": "open_page", "url": url });
+        }
+    }
+    json!({ "type": "search", "query": field("query").unwrap_or_else(|| json!("")) })
+}
+
+/// 完成的 web_search_call 项
+fn web_search_call_item(id: &str, input: &Value) -> Value {
+    json!({
+        "id": web_search_item_id(id),
+        "type": "web_search_call",
+        "status": "completed",
+        "action": web_search_action(input),
+    })
+}
+
 fn is_custom(custom_tool_names: &[String], name: &str) -> bool {
     custom_tool_names.iter().any(|n| n == name)
 }
@@ -706,7 +744,12 @@ pub fn render_response(
                 is_custom(custom_tool_names, name),
                 "completed",
             ),
-            Block::Image { .. } | Block::Document { .. } | Block::ToolResult { .. } => continue,
+            Block::ServerToolUse { id, input, .. } => web_search_call_item(id, input),
+            // Responses 不返回搜索结果列表，没有对应的输出项
+            Block::ServerToolResult { .. }
+            | Block::Image { .. }
+            | Block::Document { .. }
+            | Block::ToolResult { .. } => continue,
         };
         output.push(item);
     }
@@ -857,6 +900,30 @@ impl StreamEncoder {
         self.output.insert(output_index, item);
     }
 
+    /// 内置搜索调用：载荷一次到齐，直接输出完整的事件序列，不留打开的块
+    fn web_search_call(&mut self, out: &mut Vec<Bytes>, id: &str, input: &Value) {
+        let output_index = self.next_output_index();
+        let item = web_search_call_item(id, input);
+        let item_id = item["id"].clone();
+        self.item_added(
+            out,
+            output_index,
+            json!({ "id": item_id, "type": "web_search_call", "status": "in_progress" }),
+        );
+        for kind in [
+            "response.web_search_call.in_progress",
+            "response.web_search_call.searching",
+            "response.web_search_call.completed",
+        ] {
+            self.emit(
+                out,
+                kind,
+                json!({ "item_id": item_id, "output_index": output_index }),
+            );
+        }
+        self.item_done(out, output_index, item);
+    }
+
     fn open_block(&mut self, out: &mut Vec<Bytes>, index: usize, kind: BlockKind) {
         let block = match kind {
             BlockKind::Text => {
@@ -928,6 +995,12 @@ impl StreamEncoder {
                     signature: None,
                 }
             }
+            BlockKind::ServerToolUse { id, input, .. } => {
+                self.web_search_call(out, &id, &input);
+                return;
+            }
+            // Responses 没有搜索结果项：丢弃，不占 output_index
+            BlockKind::ServerToolResult { .. } => return,
         };
         self.open.insert(index, block);
     }
@@ -2107,5 +2180,106 @@ mod tests {
         assert_eq!(error_type_for_status(429), "rate_limit_error");
         assert_eq!(error_type_for_status(503), "server_error");
         assert_eq!(error_type_for_status(418), "api_error");
+    }
+
+    // ---- 内置搜索 → web_search_call ----
+
+    fn search_response() -> Response {
+        Response {
+            id: "msg_1".into(),
+            model: "claude-sonnet-4-5".into(),
+            content: vec![
+                Block::ServerToolUse {
+                    id: "srvtoolu_01abc".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "rust"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "srvtoolu_01abc".into(),
+                    content: json!([{"type": "web_search_result", "url": "https://a.dev", "title": "A"}]),
+                },
+                Block::Text {
+                    text: "Rust.".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn renders_web_search_calls() {
+        let value = render_response(&search_response(), "gpt-5-codex", &[]);
+        let output = value["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "search results take no output item");
+        assert_eq!(
+            output[0],
+            json!({
+                "id": "ws_01abc",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"type": "search", "query": "rust"}
+            })
+        );
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["id"], "msg_msg_1_1");
+        assert_eq!(value["status"], "completed");
+
+        assert_eq!(web_search_item_id("ws_1"), "ws_1");
+        assert_eq!(web_search_item_id("plain"), "ws_plain");
+        assert_eq!(
+            web_search_action(&json!({"url": "https://a.dev"})),
+            json!({"type": "open_page", "url": "https://a.dev"})
+        );
+        assert_eq!(
+            web_search_action(&json!({"url": "https://a.dev", "pattern": "x"})),
+            json!({"type": "find", "pattern": "x", "url": "https://a.dev"})
+        );
+        assert_eq!(
+            web_search_action(&json!({})),
+            json!({"type": "search", "query": ""})
+        );
+    }
+
+    #[test]
+    fn stream_encoder_web_search_call_sequence() {
+        let mut encoder = StreamEncoder::new("gpt-5-codex", Vec::new());
+        let events = encode_all(&mut encoder, crate::ir::response_events(&search_response()));
+        check_structure(&events);
+        assert_eq!(
+            names(&events),
+            [
+                "created",
+                "in_progress",
+                "output_item.added",
+                "web_search_call.in_progress",
+                "web_search_call.searching",
+                "web_search_call.completed",
+                "output_item.done",
+                "output_item.added",
+                "content_part.added",
+                "output_text.delta",
+                "output_text.done",
+                "content_part.done",
+                "output_item.done",
+                "completed"
+            ]
+        );
+        assert_eq!(
+            events[2].1["item"],
+            json!({"id": "ws_01abc", "type": "web_search_call", "status": "in_progress"})
+        );
+        for event in &events[3..6] {
+            assert_eq!(event.1["item_id"], "ws_01abc");
+            assert_eq!(event.1["output_index"], 0);
+        }
+        assert_eq!(events[6].1["item"]["status"], "completed");
+        assert_eq!(events[6].1["item"]["action"]["query"], "rust");
+        // 结果块不占 output_index：文本是第 1 项
+        assert_eq!(events[7].1["output_index"], 1);
+        let response = &events.last().unwrap().1["response"];
+        assert_eq!(
+            response["output"],
+            render_response(&search_response(), "gpt-5-codex", &[])["output"]
+        );
     }
 }

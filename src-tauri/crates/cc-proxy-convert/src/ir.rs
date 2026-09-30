@@ -78,6 +78,19 @@ pub enum Block {
     RedactedThinking {
         signature: Signature,
     },
+    /// 上游在服务端执行的内置工具调用（目前只有 web search）；`input` 为 Anthropic
+    /// `server_tool_use.input` 形态（如 `{query}`）
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// 内置工具的执行结果；`content` 为 Anthropic `web_search_tool_result.content` 形态：
+    /// 结果数组 `[{type: "web_search_result", url, title, ...}]` 或错误对象
+    ServerToolResult {
+        call_id: String,
+        content: Value,
+    },
 }
 
 /// 上游返回的、要求在后续请求中原样回放的不透明值（§5.5）
@@ -241,7 +254,21 @@ pub enum BlockKind {
     Text,
     Thinking,
     RedactedThinking,
-    ToolCall { id: String, name: String },
+    ToolCall {
+        id: String,
+        name: String,
+    },
+    /// 载荷一次到齐：只有 BlockStart + BlockStop，没有增量
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// 载荷一次到齐：只有 BlockStart + BlockStop，没有增量
+    ServerToolResult {
+        call_id: String,
+        content: Value,
+    },
 }
 
 /// 规范化的流式事件（§4.3）：每个块有 BlockStart / BlockStop 配对，index 从 0 递增，
@@ -339,6 +366,21 @@ pub fn response_events(response: &Response) -> Vec<Event> {
                     partial_json: arguments.clone(),
                 }],
             ),
+            Block::ServerToolUse { id, name, input } => (
+                BlockKind::ServerToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                },
+                Vec::new(),
+            ),
+            Block::ServerToolResult { call_id, content } => (
+                BlockKind::ServerToolResult {
+                    call_id: call_id.clone(),
+                    content: content.clone(),
+                },
+                Vec::new(),
+            ),
             Block::Image { .. } | Block::Document { .. } | Block::ToolResult { .. } => continue,
         };
         out.push(Event::BlockStart { index, kind });
@@ -390,5 +432,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(usage.total_input(), 17);
+    }
+
+    #[test]
+    fn server_tool_blocks_expand_to_start_and_stop() {
+        let response = Response {
+            content: vec![
+                Block::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "web_search".into(),
+                    input: serde_json::json!({"query": "rust"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "srvtoolu_1".into(),
+                    content: serde_json::json!([]),
+                },
+                Block::Text { text: "ok".into() },
+            ],
+            ..Default::default()
+        };
+        let events = response_events(&response);
+        assert_eq!(
+            events[1..5],
+            [
+                Event::BlockStart {
+                    index: 0,
+                    kind: BlockKind::ServerToolUse {
+                        id: "srvtoolu_1".into(),
+                        name: "web_search".into(),
+                        input: serde_json::json!({"query": "rust"}),
+                    },
+                },
+                Event::BlockStop { index: 0 },
+                Event::BlockStart {
+                    index: 1,
+                    kind: BlockKind::ServerToolResult {
+                        call_id: "srvtoolu_1".into(),
+                        content: serde_json::json!([]),
+                    },
+                },
+                Event::BlockStop { index: 1 },
+            ]
+        );
+        assert_eq!(
+            events[5],
+            Event::BlockStart {
+                index: 2,
+                kind: BlockKind::Text
+            }
+        );
     }
 }

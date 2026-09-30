@@ -12,7 +12,7 @@ use cc_proxy_core::Interface;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::Value;
 
-use crate::ir::{self, Event, Request, Response};
+use crate::ir::{self, Block, BlockKind, Event, Request, Response, ServerToolKind};
 use crate::{anthropic, chat, gemini, responses, responses_upstream, sse};
 
 /// 客户端协议可以作为转换源
@@ -108,6 +108,21 @@ fn render_upstream_request(
     }
 }
 
+/// 客户端声明的内置搜索工具在客户端侧的名字（Anthropic 为 `name`，缺省 `web_search`）
+fn hosted_web_search(request: &Request) -> Option<String> {
+    request
+        .server_tools
+        .iter()
+        .find(|tool| tool.kind == ServerToolKind::WebSearch)
+        .map(|tool| {
+            tool.raw
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("web_search")
+                .to_string()
+        })
+}
+
 pub fn convert_request(
     ctx: &ConversionContext<'_>,
     request: &InboundRequest<'_>,
@@ -160,7 +175,7 @@ pub fn convert_request(
                 .filter(|t| t.custom)
                 .map(|t| t.name.clone())
                 .collect(),
-            hosted_web_search: None,
+            hosted_web_search: hosted_web_search(&ir),
         },
     })
 }
@@ -337,6 +352,8 @@ pub struct CrossResponse {
     client_model: String,
     upstream_model: String,
     custom_tool_names: Vec<String>,
+    /// 客户端侧的内置搜索工具名：上游返回的 ServerToolUse 改用该名字
+    hosted_web_search: Option<String>,
     parser: sse::SseParser,
     decoder: Decoder,
     encoder: Encoder,
@@ -353,6 +370,7 @@ impl CrossResponse {
             client_model: meta.client_model.clone(),
             upstream_model: meta.upstream_model.clone(),
             custom_tool_names: meta.custom_tool_names.clone(),
+            hosted_web_search: meta.hosted_web_search.clone(),
             parser: sse::SseParser::new(),
             decoder: Decoder::new(ctx.upstream, &meta.upstream_model),
             encoder: Encoder::new(ctx.client, meta),
@@ -361,10 +379,33 @@ impl CrossResponse {
     }
 
     fn encode_events(&mut self, events: Vec<Event>) -> Vec<Bytes> {
-        events
-            .into_iter()
-            .flat_map(|event| self.encoder.encode(event))
-            .collect()
+        let mut out = Vec::new();
+        for mut event in events {
+            if let (
+                Some(hosted),
+                Event::BlockStart {
+                    kind: BlockKind::ServerToolUse { name, .. },
+                    ..
+                },
+            ) = (&self.hosted_web_search, &mut event)
+            {
+                name.clone_from(hosted);
+            }
+            out.extend(self.encoder.encode(event));
+        }
+        out
+    }
+
+    /// 非流式响应中的 ServerToolUse 改用客户端侧工具名
+    fn rename_server_tools(&self, response: &mut Response) {
+        let Some(hosted) = &self.hosted_web_search else {
+            return;
+        };
+        for block in &mut response.content {
+            if let Block::ServerToolUse { name, .. } = block {
+                name.clone_from(hosted);
+            }
+        }
     }
 
     fn encode_buffered(&mut self, buffer: &[u8]) -> Vec<Bytes> {
@@ -438,8 +479,9 @@ impl ResponseConverter for CrossResponse {
         }
         let value: Value = serde_json::from_slice(body)
             .map_err(|e| ConvertError::Response(format!("upstream returned invalid JSON: {e}")))?;
-        let response = parse_upstream_response(self.upstream, &value, &self.upstream_model)
+        let mut response = parse_upstream_response(self.upstream, &value, &self.upstream_model)
             .map_err(ConvertError::Response)?;
+        self.rename_server_tools(&mut response);
         Ok(Bytes::from(
             render_client_response(
                 self.client,
@@ -449,5 +491,73 @@ impl ResponseConverter for CrossResponse {
             )
             .to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn claude_search_request(tool_name: Option<&str>) -> Request {
+        let mut tool = json!({"type": "web_search_20250305"});
+        if let Some(name) = tool_name {
+            tool["name"] = json!(name);
+        }
+        anthropic::parse_request(&json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 100,
+            "tools": [tool],
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "rust"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": []},
+                    {"type": "text", "text": "answer"}
+                ]},
+                {"role": "user", "content": "more"}
+            ]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn hosted_web_search_uses_the_client_tool_name() {
+        assert_eq!(
+            hosted_web_search(&claude_search_request(Some("web_search"))).as_deref(),
+            Some("web_search")
+        );
+        assert_eq!(
+            hosted_web_search(&claude_search_request(None)).as_deref(),
+            Some("web_search")
+        );
+        let codex = responses::parse_request(&json!({
+            "model": "gpt-5-codex",
+            "tools": [{"type": "web_search"}],
+            "input": "q"
+        }))
+        .unwrap();
+        assert_eq!(hosted_web_search(&codex).as_deref(), Some("web_search"));
+        let mut plain = claude_search_request(None);
+        plain.server_tools.clear();
+        assert_eq!(hosted_web_search(&plain), None);
+    }
+
+    #[test]
+    fn search_history_is_dropped_for_chat_and_gemini_upstreams() {
+        let request = claude_search_request(None);
+        let options = chat::RenderOptions {
+            upstream_model: "m",
+            default_max_output_tokens: 100,
+        };
+        for upstream in [Interface::OpenaiChat, Interface::Gemini] {
+            let (_, _, body) = render_upstream_request(upstream, &request, &options).unwrap();
+            let text = body.to_string();
+            assert!(
+                !text.contains("srvtoolu_1") && text.contains("answer"),
+                "{}: {text}",
+                upstream.as_str()
+            );
+        }
     }
 }

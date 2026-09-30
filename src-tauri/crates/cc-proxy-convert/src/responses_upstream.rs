@@ -291,6 +291,10 @@ fn render_assistant(message: &Message, input: &mut Vec<Value>) {
                     input.push(item);
                 }
             }
+            Block::ServerToolUse { .. } | Block::ServerToolResult { .. } => {
+                // web_search_call 需要上游保存的服务端状态才能回放（本中转以 store: false 请求）
+                tracing::debug!("内置搜索的历史块无法回放给 Responses 上游，已丢弃");
+            }
             // 无签名的推理文本无法回放
             _ => {}
         }
@@ -429,6 +433,40 @@ fn custom_arguments(input: &str) -> String {
     json!({ "input": input }).to_string()
 }
 
+/// web_search_call 项 → ServerToolUse + ServerToolResult。Responses 不返回结果列表（引用在
+/// message 的 url_citation 注解中，本期不映射），结果为空数组；搜索失败时为错误对象
+fn web_search_blocks(item: &Value) -> [Block; 2] {
+    let id = string_field(item, "id");
+    let mut input = Map::new();
+    if let Some(action) = item.get("action").and_then(Value::as_object) {
+        for key in ["query", "url", "pattern"] {
+            if let Some(value) = action.get(key).filter(|v| !v.is_null()) {
+                input.insert(key.into(), value.clone());
+            }
+        }
+    }
+    let failed = matches!(
+        item.get("status").and_then(Value::as_str),
+        Some("failed" | "incomplete" | "cancelled")
+    ) || item.get("error").is_some_and(|e| !e.is_null());
+    let content = if failed {
+        json!({ "type": "web_search_tool_result_error", "error_code": "unavailable" })
+    } else {
+        json!([])
+    };
+    [
+        Block::ServerToolUse {
+            id: id.clone(),
+            name: "web_search".into(),
+            input: Value::Object(input),
+        },
+        Block::ServerToolResult {
+            call_id: id,
+            content,
+        },
+    ]
+}
+
 fn is_json_object(text: &str) -> bool {
     serde_json::from_str::<Value>(text).is_ok_and(|value| value.is_object())
 }
@@ -517,7 +555,8 @@ pub fn parse_response(body: &Value) -> Result<Response, String> {
                     signature: None,
                 });
             }
-            // web_search_call 等内置工具项暂不映射
+            Some("web_search_call") => content.extend(web_search_blocks(item)),
+            // 其他内置工具项暂不映射
             _ => {}
         }
     }
@@ -544,7 +583,8 @@ enum ItemKind {
     Reasoning,
     FunctionCall,
     CustomToolCall,
-    /// web_search_call 等暂不映射的项
+    WebSearchCall,
+    /// 其他暂不映射的项
     Ignored,
 }
 
@@ -555,6 +595,7 @@ impl ItemKind {
             Some("reasoning") => ItemKind::Reasoning,
             Some("function_call") => ItemKind::FunctionCall,
             Some("custom_tool_call") => ItemKind::CustomToolCall,
+            Some("web_search_call") => ItemKind::WebSearchCall,
             _ => ItemKind::Ignored,
         }
     }
@@ -950,6 +991,25 @@ impl StreamDecoder {
                         index,
                         partial_json: custom_arguments(input),
                     });
+                }
+            }
+            ItemKind::WebSearchCall => {
+                // 调用与结果在 done 时一次到齐，各输出一个只有 start / stop 的块
+                self.close_open(out);
+                for block in web_search_blocks(item) {
+                    let kind = match block {
+                        Block::ServerToolUse { id, name, input } => {
+                            BlockKind::ServerToolUse { id, name, input }
+                        }
+                        Block::ServerToolResult { call_id, content } => {
+                            BlockKind::ServerToolResult { call_id, content }
+                        }
+                        _ => continue,
+                    };
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    out.push(Event::BlockStart { index, kind });
+                    out.push(Event::BlockStop { index });
                 }
             }
             ItemKind::Ignored => {}
@@ -1365,7 +1425,9 @@ mod tests {
                 {"type": "message", "role": "assistant", "content": [
                     {"type": "output_text", "text": "Hi"}, {"type": "refusal", "refusal": " no"}
                 ]},
-                {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust"}},
+                {"type": "web_search_call", "id": "ws_2", "status": "completed", "action": {"type": "open_page", "url": "https://a.dev"}},
+                {"type": "web_search_call", "id": "ws_3", "status": "failed", "action": {"type": "find", "pattern": "x", "url": "https://a.dev"}},
                 {"type": "function_call", "call_id": "call_1", "name": "Bash", "arguments": "{\"a\":1}", "status": "completed"},
                 {"type": "custom_tool_call", "call_id": "call_2", "name": "apply_patch", "input": "*** Begin Patch"}
             ],
@@ -1392,6 +1454,33 @@ mod tests {
                     signature: None,
                 },
                 text("Hi no"),
+                Block::ServerToolUse {
+                    id: "ws_1".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "rust"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "ws_1".into(),
+                    content: json!([]),
+                },
+                Block::ServerToolUse {
+                    id: "ws_2".into(),
+                    name: "web_search".into(),
+                    input: json!({"url": "https://a.dev"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "ws_2".into(),
+                    content: json!([]),
+                },
+                Block::ServerToolUse {
+                    id: "ws_3".into(),
+                    name: "web_search".into(),
+                    input: json!({"url": "https://a.dev", "pattern": "x"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "ws_3".into(),
+                    content: json!({"type": "web_search_tool_result_error", "error_code": "unavailable"}),
+                },
                 tool_call("call_1", "Bash", "{\"a\":1}"),
                 tool_call("call_2", "apply_patch", r#"{"input":"*** Begin Patch"}"#),
             ]
@@ -2065,5 +2154,106 @@ mod tests {
         for size in 1..bytes.len() {
             assert_eq!(run(size), expected, "chunk size {size}");
         }
+    }
+
+    // ---- 内置搜索 ----
+
+    #[test]
+    fn stream_web_search_call_becomes_server_tool_blocks() {
+        let done_item = json!({"id": "ws_1", "type": "web_search_call", "status": "completed",
+            "action": {"type": "search", "query": "rust", "sources": [{"type": "url", "url": "https://a.dev"}]}});
+        let events = decode(&[
+            created(),
+            ev(
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "ws_1", "type": "web_search_call", "status": "in_progress"}}),
+            ),
+            ev(
+                "response.web_search_call.in_progress",
+                json!({"output_index": 0, "item_id": "ws_1"}),
+            ),
+            ev(
+                "response.web_search_call.searching",
+                json!({"output_index": 0, "item_id": "ws_1"}),
+            ),
+            ev(
+                "response.web_search_call.completed",
+                json!({"output_index": 0, "item_id": "ws_1"}),
+            ),
+            ev(
+                "response.output_item.done",
+                json!({"output_index": 0, "item": done_item}),
+            ),
+            ev(
+                "response.output_text.delta",
+                json!({"output_index": 1, "item_id": "msg_1", "content_index": 0, "delta": "Rust."}),
+            ),
+            ev(
+                "response.output_item.done",
+                json!({"output_index": 1, "item": {"type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "Rust."}]}}),
+            ),
+            completed(json!([done_item, {"type": "message"}])),
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                start(),
+                Event::BlockStart {
+                    index: 0,
+                    kind: BlockKind::ServerToolUse {
+                        id: "ws_1".into(),
+                        name: "web_search".into(),
+                        input: json!({"query": "rust"}),
+                    },
+                },
+                Event::BlockStop { index: 0 },
+                Event::BlockStart {
+                    index: 1,
+                    kind: BlockKind::ServerToolResult {
+                        call_id: "ws_1".into(),
+                        content: json!([]),
+                    },
+                },
+                Event::BlockStop { index: 1 },
+                Event::BlockStart {
+                    index: 2,
+                    kind: BlockKind::Text,
+                },
+                Event::TextDelta {
+                    index: 2,
+                    text: "Rust.".into(),
+                },
+                Event::BlockStop { index: 2 },
+                // 搜索不改变结束原因
+                finish(StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_history_is_not_replayed_to_responses() {
+        let req = request(vec![
+            user(vec![text("q")]),
+            assistant(vec![
+                Block::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "rust"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "srvtoolu_1".into(),
+                    content: json!([]),
+                },
+                text("answer"),
+            ]),
+        ]);
+        let body = render_request(&req, &opts("m")).unwrap();
+        assert_eq!(
+            body["input"],
+            json!([
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}
+            ])
+        );
     }
 }

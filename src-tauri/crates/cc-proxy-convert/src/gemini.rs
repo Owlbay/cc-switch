@@ -605,6 +605,12 @@ fn assemble(events: Vec<Event>) -> Result<Response, String> {
                     arguments: String::new(),
                     signature: None,
                 },
+                BlockKind::ServerToolUse { id, name, input } => {
+                    Block::ServerToolUse { id, name, input }
+                }
+                BlockKind::ServerToolResult { call_id, content } => {
+                    Block::ServerToolResult { call_id, content }
+                }
             }),
             Event::TextDelta { index, text } => {
                 if let Some(Block::Text { text: buffer }) = response.content.get_mut(index) {
@@ -1746,6 +1752,8 @@ mod tests {
                         BlockKind::Thinking => "thinking".to_string(),
                         BlockKind::RedactedThinking => "redacted".to_string(),
                         BlockKind::ToolCall { name, .. } => format!("tool:{name}"),
+                        BlockKind::ServerToolUse { name, .. } => format!("server:{name}"),
+                        BlockKind::ServerToolResult { .. } => "server_result".to_string(),
                     };
                     out.push((label, String::new()));
                 }

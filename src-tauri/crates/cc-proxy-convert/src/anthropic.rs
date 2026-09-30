@@ -191,12 +191,39 @@ fn parse_block(block: &Value) -> Option<Block> {
                 signature: parse_signature(raw, block),
             })
         }
+        "server_tool_use" => parse_server_tool_use(block),
+        "web_search_tool_result" => parse_web_search_result(block),
         other => {
-            // server_tool_use、web_search_tool_result 等内置工具的历史块：跨协议无法表达（§5.4）
+            // code_execution 等其他内置工具的历史块：跨协议无法表达（§5.4）
             tracing::debug!(block_type = other, "丢弃无法跨协议表达的内容块");
             None
         }
     }
+}
+
+/// `server_tool_use` 块 → IR（请求历史与上游响应共用）
+fn parse_server_tool_use(block: &Value) -> Option<Block> {
+    Some(Block::ServerToolUse {
+        id: block.get("id")?.as_str()?.to_string(),
+        name: block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("web_search")
+            .to_string(),
+        input: block
+            .get("input")
+            .filter(|input| input.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    })
+}
+
+/// `web_search_tool_result` 块 → IR（请求历史与上游响应共用）
+fn parse_web_search_result(block: &Value) -> Option<Block> {
+    Some(Block::ServerToolResult {
+        call_id: block.get("tool_use_id")?.as_str()?.to_string(),
+        content: block.get("content").cloned().unwrap_or_else(|| json!([])),
+    })
 }
 
 fn parse_tool(tool: &Value, request: &mut Request) {
@@ -296,6 +323,23 @@ fn usage_json(usage: &Usage) -> Value {
     })
 }
 
+/// 带内置搜索次数的 usage：`web_search_requests` 为 server_tool_use 块数，为 0 时不写
+fn usage_with_searches(usage: &Usage, web_search_requests: u64) -> Value {
+    let mut value = usage_json(usage);
+    if web_search_requests > 0 {
+        value["server_tool_use"] = json!({ "web_search_requests": web_search_requests });
+    }
+    value
+}
+
+fn server_tool_use_json(id: &str, name: &str, input: &Value) -> Value {
+    json!({ "type": "server_tool_use", "id": id, "name": name, "input": input })
+}
+
+fn web_search_result_json(call_id: &str, content: &Value) -> Value {
+    json!({ "type": "web_search_tool_result", "tool_use_id": call_id, "content": content })
+}
+
 /// 发给 Claude 客户端的签名字符串：同源时为原始签名，跨协议时为封套
 fn thinking_signature(signature: &Signature) -> String {
     if signature.source == Interface::Claude {
@@ -348,12 +392,19 @@ fn block_json(block: &Block) -> Option<Value> {
             arguments,
             ..
         } => json!({ "type": "tool_use", "id": id, "name": name, "input": tool_input(arguments) }),
+        Block::ServerToolUse { id, name, input } => server_tool_use_json(id, name, input),
+        Block::ServerToolResult { call_id, content } => web_search_result_json(call_id, content),
         Block::Image { .. } | Block::Document { .. } | Block::ToolResult { .. } => return None,
     })
 }
 
 /// IR 响应 → Anthropic Messages 响应；`model` 用客户端请求的模型名
 pub fn render_response(response: &Response, client_model: &str) -> Value {
+    let searches = response
+        .content
+        .iter()
+        .filter(|block| matches!(block, Block::ServerToolUse { .. }))
+        .count() as u64;
     json!({
         "id": response.id,
         "type": "message",
@@ -362,7 +413,7 @@ pub fn render_response(response: &Response, client_model: &str) -> Value {
         "content": response.content.iter().filter_map(block_json).collect::<Vec<_>>(),
         "stop_reason": stop_reason_str(&response.stop_reason),
         "stop_sequence": Value::Null,
-        "usage": usage_json(&response.usage),
+        "usage": usage_with_searches(&response.usage, searches),
     })
 }
 
@@ -377,6 +428,8 @@ pub struct StreamEncoder {
     finished: bool,
     /// redacted_thinking 必须在 content_block_start 中带上数据：等到签名再输出
     pending_redacted: Option<usize>,
+    /// 已输出的 server_tool_use 块数（写入 usage.server_tool_use.web_search_requests）
+    web_search_requests: u64,
 }
 
 impl StreamEncoder {
@@ -386,6 +439,7 @@ impl StreamEncoder {
             started: false,
             finished: false,
             pending_redacted: None,
+            web_search_requests: 0,
         }
     }
 
@@ -437,6 +491,24 @@ impl StreamEncoder {
                     }
                     BlockKind::ToolCall { id, name } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": {} })
+                    }
+                    BlockKind::ServerToolUse { id, name, input } => {
+                        // 与官方流式形态一致：start 带空 input，完整 input 走一条 input_json_delta
+                        self.web_search_requests += 1;
+                        Self::emit(
+                            &mut out,
+                            "content_block_start",
+                            json!({ "type": "content_block_start", "index": index, "content_block": server_tool_use_json(&id, &name, &json!({})) }),
+                        );
+                        Self::emit(
+                            &mut out,
+                            "content_block_delta",
+                            json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": input.to_string() } }),
+                        );
+                        return out;
+                    }
+                    BlockKind::ServerToolResult { call_id, content } => {
+                        web_search_result_json(&call_id, &content)
                     }
                 };
                 Self::emit(
@@ -499,7 +571,7 @@ impl StreamEncoder {
                     json!({
                         "type": "message_delta",
                         "delta": { "stop_reason": stop_reason_str(&stop_reason), "stop_sequence": Value::Null },
-                        "usage": usage_json(&usage),
+                        "usage": usage_with_searches(&usage, self.web_search_requests),
                     }),
                 );
                 Self::emit(&mut out, "message_stop", json!({ "type": "message_stop" }));
@@ -775,6 +847,13 @@ fn render_request_block(block: &Block, role: Role) -> Result<Option<Value>, Stri
             }
             value
         }
+        // 内置搜索的调用与结果都在 assistant 消息内，原样还原
+        (Block::ServerToolUse { id, name, input }, Role::Assistant) => {
+            server_tool_use_json(id, name, input)
+        }
+        (Block::ServerToolResult { call_id, content }, Role::Assistant) => {
+            web_search_result_json(call_id, content)
+        }
         // 无同源签名的 thinking 整块丢弃（§5.2 第 8 条）
         (Block::Thinking { text, signature }, Role::Assistant) => {
             match signature
@@ -803,6 +882,28 @@ fn render_request_block(block: &Block, role: Role) -> Result<Option<Value>, Stri
         }
     };
     Ok(Some(value))
+}
+
+/// 同一条 assistant 消息内 server_tool_use 与 web_search_tool_result 必须按 id 配对，
+/// 缺一方的块（上游会拒绝）丢弃
+fn drop_unpaired_server_blocks(turn: &mut Turn) {
+    let uses = block_ids(turn, "server_tool_use", "id");
+    let results = block_ids(turn, "web_search_tool_result", "tool_use_id");
+    let before = turn.blocks.len();
+    turn.blocks.retain(|block| match block_type(block) {
+        "server_tool_use" => block
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| results.iter().any(|r| r == id)),
+        "web_search_tool_result" => block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| uses.iter().any(|u| u == id)),
+        _ => true,
+    });
+    if turn.blocks.len() != before {
+        tracing::debug!("丢弃不配对的 server_tool_use / web_search_tool_result 块");
+    }
 }
 
 fn block_ids(turn: &Turn, kind: &str, field: &str) -> Vec<String> {
@@ -1056,10 +1157,12 @@ pub fn render_request(request: &Request, options: &RenderOptions<'_>) -> Result<
                 blocks.push(value);
             }
         }
-        turns.push(Turn {
+        let mut turn = Turn {
             role: message.role,
             blocks,
-        });
+        };
+        drop_unpaired_server_blocks(&mut turn);
+        turns.push(turn);
     }
     let turns = normalize_turns(turns)?;
 
@@ -1239,8 +1342,10 @@ fn parse_response_block(block: &Value) -> Option<Block> {
                 .unwrap_or_else(|| "{}".to_string()),
             signature: None,
         }),
+        "server_tool_use" => parse_server_tool_use(block),
+        "web_search_tool_result" => parse_web_search_result(block),
         other => {
-            // server_tool_use、web_search_tool_result 等：暂不映射
+            // 其他内置工具的结果块：暂不映射
             tracing::debug!(block_type = other, "丢弃上游响应中暂不支持的内容块");
             None
         }
@@ -1299,7 +1404,20 @@ enum OpenBlock {
         streamed: bool,
     },
     RedactedThinking,
+    /// server_tool_use：input 通常以 input_json_delta 流式给出，而 IR 要求载荷一次到齐，
+    /// 故到 content_block_stop 才分配 IR index 并整体输出
+    ServerToolUse {
+        id: String,
+        name: String,
+        /// content_block_start 里的 input
+        input: Value,
+        /// 累积的 input_json_delta
+        partial: String,
+    },
 }
+
+/// 延迟分配 IR index 的块（server_tool_use）在 `open` 中的占位 index
+const DEFERRED_INDEX: usize = usize::MAX;
 
 /// 认识的 SSE event 名；其余（含缺失）以 `data.type` 为准
 const STREAM_EVENTS: [&str; 8] = [
@@ -1453,6 +1571,48 @@ impl StreamDecoder {
                 .unwrap_or_default()
                 .to_string()
         };
+        if self.open.iter().any(|(i, ..)| *i == upstream) {
+            tracing::debug!(index = upstream, "忽略重复的 content_block_start");
+            return;
+        }
+        match block_type(block) {
+            "server_tool_use" => {
+                self.ensure_started("msg", "", out);
+                self.open.push((
+                    upstream,
+                    DEFERRED_INDEX,
+                    OpenBlock::ServerToolUse {
+                        id: string("id"),
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("web_search")
+                            .to_string(),
+                        input: block.get("input").cloned().unwrap_or(Value::Null),
+                        partial: String::new(),
+                    },
+                ));
+                return;
+            }
+            "web_search_tool_result" => {
+                // 结果在 content_block_start 中完整给出，没有 delta：直接输出整块，
+                // 随后的 content_block_stop 找不到打开的块而被忽略
+                if let Some(Block::ServerToolResult { call_id, content }) =
+                    parse_web_search_result(block)
+                {
+                    self.ensure_started("msg", "", out);
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    out.push(Event::BlockStart {
+                        index,
+                        kind: BlockKind::ServerToolResult { call_id, content },
+                    });
+                    out.push(Event::BlockStop { index });
+                }
+                return;
+            }
+            _ => {}
+        }
         let (kind, state) = match block_type(block) {
             "text" => (BlockKind::Text, OpenBlock::Text),
             "thinking" => (
@@ -1474,15 +1634,11 @@ impl StreamDecoder {
             ),
             "redacted_thinking" => (BlockKind::RedactedThinking, OpenBlock::RedactedThinking),
             other => {
-                // server_tool_use、web_search_tool_result 等：暂不映射，不占 IR index
+                // 其他内置工具的结果块等：暂不映射，不占 IR index
                 tracing::debug!(block_type = other, "跳过上游流中暂不支持的内容块");
                 return;
             }
         };
-        if self.open.iter().any(|(i, ..)| *i == upstream) {
-            tracing::debug!(index = upstream, "忽略重复的 content_block_start");
-            return;
-        }
         self.ensure_started("msg", "", out);
         let index = self.next_index;
         self.next_index += 1;
@@ -1545,6 +1701,9 @@ impl StreamDecoder {
             }
             // 签名累积到块结束再整体输出一次
             ("signature_delta", OpenBlock::Thinking { signature, .. }) => signature.push_str(text),
+            ("input_json_delta", OpenBlock::ServerToolUse { partial, .. }) => {
+                partial.push_str(text)
+            }
             ("input_json_delta", OpenBlock::ToolUse { streamed, .. }) => {
                 *streamed = true;
                 out.push(Event::ToolArgumentsDelta {
@@ -1559,6 +1718,30 @@ impl StreamDecoder {
     fn close(&mut self, position: usize, out: &mut Vec<Event>) {
         let (_, index, state) = self.open.remove(position);
         match state {
+            OpenBlock::ServerToolUse {
+                id,
+                name,
+                input,
+                partial,
+            } => {
+                let input = if partial.trim().is_empty() {
+                    input
+                } else {
+                    serde_json::from_str::<Value>(&partial).unwrap_or_else(|_| {
+                        tracing::warn!("上游 server_tool_use 的 input 不是合法 JSON，替换为 {{}}");
+                        json!({})
+                    })
+                };
+                let input = if input.is_object() { input } else { json!({}) };
+                let index = self.next_index;
+                self.next_index += 1;
+                out.push(Event::BlockStart {
+                    index,
+                    kind: BlockKind::ServerToolUse { id, name, input },
+                });
+                out.push(Event::BlockStop { index });
+                return;
+            }
             OpenBlock::Thinking { text, signature } if !signature.is_empty() => {
                 out.push(Event::SignatureDelta {
                     index,
@@ -2580,6 +2763,15 @@ mod tests {
                         value: json!({"type": "redacted_thinking", "data": "opaque"}),
                     },
                 },
+                Block::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "q"}),
+                },
+                Block::ServerToolResult {
+                    call_id: "srvtoolu_1".into(),
+                    content: json!([]),
+                },
                 text("hi"),
                 Block::ToolCall {
                     id: "toolu_1".into(),
@@ -2613,7 +2805,7 @@ mod tests {
         );
     }
 
-    /// 一条完整的上游流：thinking（签名分片）、被跳过的 server_tool_use、redacted、text、
+    /// 一条完整的上游流：thinking（签名分片）、参数分片的 server_tool_use 与搜索结果、redacted、text、
     /// 参数分片的 tool_use、只在 start 里给参数的 tool_use
     const UPSTREAM_STREAM: &[(&str, &str)] = &[
         (
@@ -2659,7 +2851,7 @@ mod tests {
         ),
         (
             "content_block_start",
-            r#"{"type":"content_block_start","index":2,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://example.com","title":"Example","encrypted_content":"enc"}]}}"#,
         ),
         (
             "content_block_stop",
@@ -2667,11 +2859,7 @@ mod tests {
         ),
         (
             "content_block_start",
-            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
-        ),
-        (
-            "content_block_delta",
-            r#"{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"你好"}}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
         ),
         (
             "content_block_stop",
@@ -2679,19 +2867,11 @@ mod tests {
         ),
         (
             "content_block_start",
-            r#"{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}"#,
+            r#"{"type":"content_block_start","index":4,"content_block":{"type":"text","text":""}}"#,
         ),
         (
             "content_block_delta",
-            r#"{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":""}}"#,
-        ),
-        (
-            "content_block_delta",
-            r#"{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
-        ),
-        (
-            "content_block_delta",
-            r#"{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"text_delta","text":"你好"}}"#,
         ),
         (
             "content_block_stop",
@@ -2699,11 +2879,31 @@ mod tests {
         ),
         (
             "content_block_start",
-            r#"{"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_2","name":"Read","input":{"path":"a"}}}"#,
+            r#"{"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":5,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
         ),
         (
             "content_block_stop",
             r#"{"type":"content_block_stop","index":5}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":6,"content_block":{"type":"tool_use","id":"toolu_2","name":"Read","input":{"path":"a"}}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":6}"#,
         ),
         (
             "message_delta",
@@ -2746,53 +2946,70 @@ mod tests {
             Event::BlockStop { index: 0 },
             Event::BlockStart {
                 index: 1,
-                kind: BlockKind::RedactedThinking,
-            },
-            Event::SignatureDelta {
-                index: 1,
-                signature: Signature {
-                    source: Interface::Claude,
-                    value: json!({"type": "redacted_thinking", "data": "opaque"}),
+                kind: BlockKind::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "q"}),
                 },
             },
             Event::BlockStop { index: 1 },
             Event::BlockStart {
                 index: 2,
-                kind: BlockKind::Text,
-            },
-            Event::TextDelta {
-                index: 2,
-                text: "你好".into(),
+                kind: BlockKind::ServerToolResult {
+                    call_id: "srvtoolu_1".into(),
+                    content: json!([{"type": "web_search_result", "url": "https://example.com", "title": "Example", "encrypted_content": "enc"}]),
+                },
             },
             Event::BlockStop { index: 2 },
             Event::BlockStart {
                 index: 3,
+                kind: BlockKind::RedactedThinking,
+            },
+            Event::SignatureDelta {
+                index: 3,
+                signature: Signature {
+                    source: Interface::Claude,
+                    value: json!({"type": "redacted_thinking", "data": "opaque"}),
+                },
+            },
+            Event::BlockStop { index: 3 },
+            Event::BlockStart {
+                index: 4,
+                kind: BlockKind::Text,
+            },
+            Event::TextDelta {
+                index: 4,
+                text: "你好".into(),
+            },
+            Event::BlockStop { index: 4 },
+            Event::BlockStart {
+                index: 5,
                 kind: BlockKind::ToolCall {
                     id: "toolu_1".into(),
                     name: "Bash".into(),
                 },
             },
             Event::ToolArgumentsDelta {
-                index: 3,
+                index: 5,
                 partial_json: "{\"command\":".into(),
             },
             Event::ToolArgumentsDelta {
-                index: 3,
+                index: 5,
                 partial_json: "\"ls\"}".into(),
             },
-            Event::BlockStop { index: 3 },
+            Event::BlockStop { index: 5 },
             Event::BlockStart {
-                index: 4,
+                index: 6,
                 kind: BlockKind::ToolCall {
                     id: "toolu_2".into(),
                     name: "Read".into(),
                 },
             },
             Event::ToolArgumentsDelta {
-                index: 4,
+                index: 6,
                 partial_json: r#"{"path":"a"}"#.into(),
             },
-            Event::BlockStop { index: 4 },
+            Event::BlockStop { index: 6 },
             Event::Finish {
                 stop_reason: StopReason::ToolUse,
                 usage: Usage {
@@ -2916,5 +3133,220 @@ mod tests {
         for size in 1..=bytes.len() {
             assert_eq!(decode_chunks(size), expected, "chunk size {size}");
         }
+    }
+
+    // ---- 内置搜索（server_tool_use / web_search_tool_result）----
+
+    fn search_blocks(id: &str) -> Vec<Block> {
+        vec![
+            Block::ServerToolUse {
+                id: id.into(),
+                name: "web_search".into(),
+                input: json!({"query": "rust"}),
+            },
+            Block::ServerToolResult {
+                call_id: id.into(),
+                content: json!([{"type": "web_search_result", "url": "https://a.dev", "title": "A", "encrypted_content": "enc"}]),
+            },
+        ]
+    }
+
+    #[test]
+    fn renders_server_tool_blocks_and_search_usage() {
+        let mut content = search_blocks("srvtoolu_1");
+        content.push(Block::Text { text: "ok".into() });
+        let response = Response {
+            id: "msg_1".into(),
+            content,
+            ..Default::default()
+        };
+        let value = render_response(&response, "m");
+        assert_eq!(
+            value["content"][0],
+            json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "rust"}})
+        );
+        assert_eq!(value["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(value["content"][1]["tool_use_id"], "srvtoolu_1");
+        assert_eq!(value["content"][1]["content"][0]["url"], "https://a.dev");
+        assert_eq!(value["stop_reason"], "end_turn");
+        assert_eq!(
+            value["usage"]["server_tool_use"],
+            json!({"web_search_requests": 1})
+        );
+
+        // 没有搜索时不写 server_tool_use
+        let plain = render_response(&Response::default(), "m");
+        assert!(plain["usage"].get("server_tool_use").is_none());
+    }
+
+    #[test]
+    fn stream_encoder_emits_server_tool_blocks() {
+        let mut encoder = StreamEncoder::new("m");
+        let mut events = vec![Event::Start {
+            id: "msg_1".into(),
+            model: "up".into(),
+            usage: Usage::default(),
+        }];
+        events.extend(
+            crate::ir::response_events(&Response {
+                content: search_blocks("srvtoolu_1"),
+                ..Default::default()
+            })[1..]
+                .iter()
+                .cloned(),
+        );
+        let frames: Vec<bytes::Bytes> = events
+            .into_iter()
+            .flat_map(|event| encoder.encode(event))
+            .collect();
+        let events = frames_to_events(&frames);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(
+            events[1].1["content_block"],
+            json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}})
+        );
+        assert_eq!(
+            events[2].1["delta"],
+            json!({"type": "input_json_delta", "partial_json": r#"{"query":"rust"}"#})
+        );
+        assert_eq!(events[4].1["index"], 1);
+        assert_eq!(
+            events[4].1["content_block"]["type"],
+            "web_search_tool_result"
+        );
+        assert_eq!(
+            events[4].1["content_block"]["content"][0]["encrypted_content"],
+            "enc"
+        );
+        assert_eq!(events[6].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(
+            events[6].1["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+    }
+
+    #[test]
+    fn search_history_is_parsed_and_replayed_to_anthropic() {
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 1000,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [
+                {"role": "user", "content": "search rust"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "rust"}},
+                    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                        {"type": "web_search_result", "url": "https://a.dev", "title": "A", "encrypted_content": "enc", "page_age": "1d"}
+                    ]},
+                    {"type": "text", "text": "Rust is a language."}
+                ]},
+                {"role": "user", "content": "more"}
+            ]
+        });
+        let request = parse_request(&body).unwrap();
+        let assistant = &request.messages[1].content;
+        assert_eq!(
+            assistant[0],
+            Block::ServerToolUse {
+                id: "srvtoolu_1".into(),
+                name: "web_search".into(),
+                input: json!({"query": "rust"}),
+            }
+        );
+        assert!(
+            matches!(&assistant[1], Block::ServerToolResult { call_id, content }
+            if call_id == "srvtoolu_1" && content[0]["page_age"] == "1d")
+        );
+
+        let rendered = render_request(&request, &opts("claude-sonnet-4-5")).unwrap();
+        assert_eq!(
+            rendered["messages"][1]["content"], body["messages"][1]["content"],
+            "search blocks are replayed verbatim"
+        );
+    }
+
+    #[test]
+    fn unpaired_or_misplaced_search_blocks_are_dropped() {
+        let request = simple(vec![
+            user(vec![text("q")]),
+            assistant(vec![
+                // 只有调用没有结果
+                Block::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "web_search".into(),
+                    input: json!({}),
+                },
+                // 只有结果没有调用
+                Block::ServerToolResult {
+                    call_id: "srvtoolu_2".into(),
+                    content: json!([]),
+                },
+                text("answer"),
+            ]),
+            // user 消息不能携带搜索块
+            user(search_blocks("srvtoolu_3")),
+            user(vec![text("next")]),
+        ]);
+        let body = render(&request, "claude-sonnet-4-5");
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "q"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "user", "content": [{"type": "text", "text": "next"}]}
+            ])
+        );
+    }
+
+    #[test]
+    fn stream_server_tool_use_input_only_in_start() {
+        let events = decode_pairs(
+            &[
+                (
+                    "message_start",
+                    r#"{"type":"message_start","message":{"id":"msg_1","model":"m","usage":{"input_tokens":1}}}"#,
+                ),
+                (
+                    "content_block_start",
+                    r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"q"}}}"#,
+                ),
+                (
+                    "content_block_stop",
+                    r#"{"type":"content_block_stop","index":0}"#,
+                ),
+                (
+                    "message_delta",
+                    r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3,"server_tool_use":{"web_search_requests":1}}}"#,
+                ),
+                ("message_stop", r#"{"type":"message_stop"}"#),
+            ],
+            true,
+        );
+        assert_eq!(
+            events[1],
+            Event::BlockStart {
+                index: 0,
+                kind: BlockKind::ServerToolUse {
+                    id: "srvtoolu_1".into(),
+                    name: "web_search".into(),
+                    input: json!({"query": "q"}),
+                },
+            }
+        );
+        assert_eq!(events[2], Event::BlockStop { index: 0 });
+        assert!(matches!(events[3], Event::Finish { .. }));
     }
 }

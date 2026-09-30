@@ -305,7 +305,8 @@ pub fn rebuild_anthropic_stream(body: &[u8]) -> (Vec<String>, Vec<Value>, Value)
             }
             "content_block_stop" => {
                 let index = data["index"].as_u64().unwrap() as usize;
-                if blocks[index]["type"] == "tool_use" {
+                let kind = &blocks[index]["type"];
+                if (kind == "tool_use" || kind == "server_tool_use") && !partial[index].is_empty() {
                     blocks[index]["input"] = serde_json::from_str(&partial[index]).unwrap();
                 }
             }
