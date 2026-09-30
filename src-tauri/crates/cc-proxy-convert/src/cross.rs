@@ -13,7 +13,7 @@ use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use serde_json::Value;
 
 use crate::ir::{self, Event, Request, Response};
-use crate::{anthropic, chat, responses, responses_upstream, sse};
+use crate::{anthropic, chat, gemini, responses, responses_upstream, sse};
 
 /// 客户端协议可以作为转换源
 pub fn is_client(protocol: Interface) -> bool {
@@ -24,7 +24,7 @@ pub fn is_client(protocol: Interface) -> bool {
 pub fn is_upstream(protocol: Interface) -> bool {
     matches!(
         protocol,
-        Interface::Claude | Interface::OpenaiChat | Interface::OpenaiResponses
+        Interface::Claude | Interface::OpenaiChat | Interface::OpenaiResponses | Interface::Gemini
     )
 }
 
@@ -101,10 +101,10 @@ fn render_upstream_request(
             None,
             anthropic::render_request(request, options)?,
         )),
-        other => Err(format!(
-            "{} upstreams are not supported yet",
-            other.as_str()
-        )),
+        Interface::Gemini => {
+            let (path, query) = gemini::request_path(options.upstream_model, request.stream);
+            Ok((path, query, gemini::render_request(request, options)?))
+        }
     }
 }
 
@@ -173,12 +173,14 @@ pub fn convert_request(
 enum Decoder {
     Anthropic(anthropic::StreamDecoder),
     Chat(chat::StreamDecoder),
+    Gemini(gemini::StreamDecoder),
     Responses(responses_upstream::StreamDecoder),
 }
 
 impl Decoder {
-    fn new(upstream: Interface) -> Self {
+    fn new(upstream: Interface, upstream_model: &str) -> Self {
         match upstream {
+            Interface::Gemini => Decoder::Gemini(gemini::StreamDecoder::new(upstream_model)),
             Interface::Claude => Decoder::Anthropic(anthropic::StreamDecoder::new()),
             Interface::OpenaiResponses => {
                 Decoder::Responses(responses_upstream::StreamDecoder::new())
@@ -191,6 +193,7 @@ impl Decoder {
         match self {
             Decoder::Anthropic(decoder) => decoder.feed(event.event.as_deref(), &event.data),
             Decoder::Chat(decoder) => decoder.feed(&event.data),
+            Decoder::Gemini(decoder) => decoder.feed(&event.data),
             Decoder::Responses(decoder) => decoder.feed(event.event.as_deref(), &event.data),
         }
     }
@@ -199,6 +202,7 @@ impl Decoder {
         match self {
             Decoder::Anthropic(decoder) => decoder.finish(),
             Decoder::Chat(decoder) => decoder.finish(),
+            Decoder::Gemini(decoder) => decoder.finish(),
             Decoder::Responses(decoder) => decoder.finish(),
         }
     }
@@ -236,8 +240,13 @@ impl Encoder {
     }
 }
 
-fn parse_upstream_response(upstream: Interface, body: &Value) -> Result<Response, String> {
+fn parse_upstream_response(
+    upstream: Interface,
+    body: &Value,
+    upstream_model: &str,
+) -> Result<Response, String> {
     match upstream {
+        Interface::Gemini => gemini::parse_response(body, upstream_model),
         Interface::Claude => anthropic::parse_response(body),
         Interface::OpenaiResponses => responses_upstream::parse_response(body),
         _ => chat::parse_response(body),
@@ -264,6 +273,7 @@ fn upstream_error_message(upstream: Interface, body: &[u8]) -> String {
     let message = parsed.as_ref().and_then(|value| match upstream {
         Interface::Claude => anthropic::error_message(value),
         Interface::OpenaiResponses => responses_upstream::error_message(value),
+        Interface::Gemini => gemini::error_message(value),
         _ => value.get("error").map(chat::error_message),
     });
     let message = message
@@ -325,6 +335,7 @@ pub struct CrossResponse {
     upstream: Interface,
     stream: bool,
     client_model: String,
+    upstream_model: String,
     custom_tool_names: Vec<String>,
     parser: sse::SseParser,
     decoder: Decoder,
@@ -340,9 +351,10 @@ impl CrossResponse {
             upstream: ctx.upstream,
             stream: meta.stream,
             client_model: meta.client_model.clone(),
+            upstream_model: meta.upstream_model.clone(),
             custom_tool_names: meta.custom_tool_names.clone(),
             parser: sse::SseParser::new(),
-            decoder: Decoder::new(ctx.upstream),
+            decoder: Decoder::new(ctx.upstream, &meta.upstream_model),
             encoder: Encoder::new(ctx.client, meta),
             json: None,
         }
@@ -358,7 +370,7 @@ impl CrossResponse {
     fn encode_buffered(&mut self, buffer: &[u8]) -> Vec<Bytes> {
         let response = serde_json::from_slice::<Value>(buffer)
             .map_err(|e| format!("upstream returned invalid JSON: {e}"))
-            .and_then(|value| parse_upstream_response(self.upstream, &value));
+            .and_then(|value| parse_upstream_response(self.upstream, &value, &self.upstream_model));
         match response {
             Ok(response) => self.encode_events(ir::response_events(&response)),
             Err(message) => self.encoder.finish(Some(&message)),
@@ -426,8 +438,8 @@ impl ResponseConverter for CrossResponse {
         }
         let value: Value = serde_json::from_slice(body)
             .map_err(|e| ConvertError::Response(format!("upstream returned invalid JSON: {e}")))?;
-        let response =
-            parse_upstream_response(self.upstream, &value).map_err(ConvertError::Response)?;
+        let response = parse_upstream_response(self.upstream, &value, &self.upstream_model)
+            .map_err(ConvertError::Response)?;
         Ok(Bytes::from(
             render_client_response(
                 self.client,

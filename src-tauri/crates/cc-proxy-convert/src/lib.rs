@@ -266,10 +266,17 @@ mod tests {
     #[test]
     fn supported_directions() {
         let c = IrConverter;
-        assert!(c.supports(Interface::Claude, Interface::Claude));
-        assert!(c.supports(Interface::Claude, Interface::OpenaiChat));
-        assert!(!c.supports(Interface::Claude, Interface::Gemini));
-        assert!(c.supports(Interface::OpenaiResponses, Interface::OpenaiResponses));
+        // 本期全部 8 个方向
+        for client in [Interface::Claude, Interface::OpenaiResponses] {
+            for upstream in Interface::ALL {
+                assert!(c.supports(client, upstream), "{client:?} -> {upstream:?}");
+            }
+        }
+        // Chat / Gemini 作客户端是后续项
+        for client in [Interface::OpenaiChat, Interface::Gemini] {
+            assert!(!c.supports(client, Interface::Claude));
+            assert!(!c.supports(client, client));
+        }
     }
 
     #[test]
