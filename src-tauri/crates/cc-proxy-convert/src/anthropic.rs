@@ -124,17 +124,20 @@ fn parse_media(source: &Value) -> Option<MediaSource> {
     }
 }
 
-/// 签名：封套按封套来源还原，否则视为来自 Anthropic 本身（值为整个块）
-fn parse_signature(raw: &str, block: &Value) -> Signature {
+/// 签名：封套按封套来源还原，否则视为来自 Anthropic 本身（值为整个块）。
+/// 形似封套却解码失败（版本不认识、结构残缺）按“缺签名”处理（§5.5），不原样回放给上游
+fn parse_signature(raw: &str, block: &Value) -> Option<Signature> {
     if envelope::looks_like(raw) {
-        if let Some(signature) = envelope::decode(raw) {
-            return signature;
+        let decoded = envelope::decode(raw);
+        if decoded.is_none() {
+            tracing::warn!("无法解码的签名封套，按缺签名处理");
         }
+        return decoded;
     }
-    Signature {
+    Some(Signature {
         source: Interface::Claude,
         value: block.clone(),
-    }
+    })
 }
 
 fn parse_block(block: &Value) -> Option<Block> {
@@ -183,12 +186,12 @@ fn parse_block(block: &Value) -> Option<Block> {
                 .get("signature")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(|raw| parse_signature(raw, block)),
+                .and_then(|raw| parse_signature(raw, block)),
         }),
         "redacted_thinking" => {
             let raw = block.get("data")?.as_str()?;
             Some(Block::RedactedThinking {
-                signature: parse_signature(raw, block),
+                signature: parse_signature(raw, block)?,
             })
         }
         "server_tool_use" => parse_server_tool_use(block),
@@ -768,7 +771,8 @@ fn request_tool_input(arguments: &str) -> Result<Value, String> {
 }
 
 /// 同源签名还原为原始块（§5.5）；不是 Anthropic 产生的签名返回 None（整块丢弃）。
-/// `text` 为 IR 中的推理文本（RedactedThinking 没有，取原始块里的）
+/// 推理文本优先取原始块里的：签名覆盖的是原文，经其他客户端协议往返后 IR 文本可能被裁剪；
+/// 原始块没有文本时才用 IR 中的 `text`
 fn replay_signed_block(text: Option<&str>, signature: &Signature) -> Option<Value> {
     if signature.source != Interface::Claude {
         return None;
@@ -785,8 +789,10 @@ fn replay_signed_block(text: Option<&str>, signature: &Signature) -> Option<Valu
         .get("signature")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())?;
-    let text = text
-        .or_else(|| raw.get("thinking").and_then(Value::as_str))
+    let text = raw
+        .get("thinking")
+        .and_then(Value::as_str)
+        .or(text)
         .unwrap_or_default();
     Some(json!({ "type": "thinking", "thinking": text, "signature": signature }))
 }
@@ -1257,8 +1263,13 @@ pub fn render_request(request: &Request, options: &RenderOptions<'_>) -> Result<
         if let Some(temperature) = request.temperature {
             body.insert("temperature".into(), json!(temperature));
         }
-        if let Some(top_p) = request.top_p {
-            body.insert("top_p".into(), json!(top_p));
+        // 较新的 Claude 模型不接受同时指定 temperature 与 top_p：两者都有时只保留 temperature
+        match (request.temperature, request.top_p) {
+            (Some(_), Some(_)) => tracing::debug!("temperature 与 top_p 同时存在，丢弃 top_p"),
+            (None, Some(top_p)) => {
+                body.insert("top_p".into(), json!(top_p));
+            }
+            _ => {}
         }
         if let Some(top_k) = request.top_k {
             body.insert("top_k".into(), json!(top_k));
@@ -2271,7 +2282,10 @@ mod tests {
         assert_eq!(body["metadata"], json!({"user_id": "u-1"}));
         assert_eq!(body["stream"], true);
         assert_eq!(body["temperature"], 0.5);
-        assert_eq!(body["top_p"], 0.9);
+        assert!(
+            body.get("top_p").is_none(),
+            "top_p dropped next to temperature"
+        );
         assert_eq!(body["top_k"], 5);
         assert!(body.get("thinking").is_none());
     }

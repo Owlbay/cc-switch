@@ -415,6 +415,10 @@ fn render_tools(request: &Request, body: &mut Map<String, Value>) {
     let mut search = false;
     for server_tool in &request.server_tools {
         match server_tool.kind {
+            // Gemini 2.x 不允许内置搜索与函数声明同时出现（整请求 400）：有函数工具时剔除搜索
+            ServerToolKind::WebSearch if !declarations.is_empty() => {
+                tracing::warn!("Gemini 上游不能同时使用搜索与函数工具，已剔除 web_search")
+            }
             ServerToolKind::WebSearch if !search => {
                 search = true;
                 tools.push(json!({ "googleSearch": {} }));
@@ -702,6 +706,9 @@ pub struct StreamDecoder {
     usage: Option<Usage>,
 }
 
+/// 判定累计快照所需的最短已输出文本（字节）
+const SNAPSHOT_MIN_PREFIX: usize = 8;
+
 impl StreamDecoder {
     pub fn new(fallback_model: impl Into<String>) -> Self {
         Self {
@@ -828,7 +835,9 @@ impl StreamDecoder {
         });
     }
 
-    /// 本片段某类文本应跳过的字节数：全部同类文本以已输出文本为前缀时视为累计快照
+    /// 本片段某类文本应跳过的字节数：与已输出文本相同视为重复片段；以已输出文本为前缀时
+    /// 视为累计快照，但已输出文本太短（如 markdown 的 `**`）时与增量片段巧合相同的概率太高，
+    /// 按增量处理
     fn snapshot_skip(&mut self, parts: &[Value], thought: bool) -> usize {
         let accumulated = if thought { &self.thought } else { &self.text };
         let total: String = parts
@@ -840,12 +849,19 @@ impl StreamDecoder {
         if self.incremental || accumulated.is_empty() || total.is_empty() {
             return 0;
         }
-        if total.starts_with(accumulated.as_str()) {
-            accumulated.len()
-        } else {
+        if !total.starts_with(accumulated.as_str()) {
+            // 不以已输出文本为前缀：确定为增量模式，此后不再按快照裁剪
             self.incremental = true;
-            0
+            return 0;
         }
+        // 与已输出文本完全相同：快照网关重复发送了同一片段
+        if total == *accumulated {
+            return accumulated.len();
+        }
+        if accumulated.len() < SNAPSHOT_MIN_PREFIX {
+            return 0;
+        }
+        accumulated.len()
     }
 
     fn parts(&mut self, parts: &[Value], out: &mut Vec<Event>) {
@@ -1403,6 +1419,18 @@ mod tests {
         };
         let body = render(&request);
         assert_eq!(body["tools"], json!([{"googleSearch": {}}]));
+
+        // 与函数工具共存时剔除搜索
+        let mut with_functions = request.clone();
+        with_functions.tools.push(Tool {
+            name: "Bash".into(),
+            description: None,
+            parameters: json!({"type": "object"}),
+            custom: false,
+        });
+        let mixed = render(&with_functions);
+        assert_eq!(mixed["tools"].as_array().unwrap().len(), 1);
+        assert!(mixed["tools"][0].get("functionDeclarations").is_some());
         assert!(
             body.get("toolConfig").is_none(),
             "no function declarations → no toolConfig"
@@ -1801,11 +1829,18 @@ mod tests {
         assert_eq!(blocks(&incremental), pairs(&[("text", "Hello!")]));
 
         let cumulative = decode(&[
-            chunk(json!([{"text": "Hel"}])),
-            chunk(json!([{"text": "Hello"}])),
-            finish_chunk(json!([{"text": "Hel"}, {"text": "lo!"}]), "STOP"),
+            chunk(json!([{"text": "Hello, wo"}])),
+            chunk(json!([{"text": "Hello, world"}])),
+            finish_chunk(json!([{"text": "Hello, "}, {"text": "world!"}]), "STOP"),
         ]);
-        assert_eq!(blocks(&cumulative), pairs(&[("text", "Hello!")]));
+        assert_eq!(blocks(&cumulative), pairs(&[("text", "Hello, world!")]));
+
+        // 很短的前缀不判定为快照：markdown 增量 "**" + "**Bold**" 不能被吞掉
+        let markdown = decode(&[
+            chunk(json!([{"text": "**"}])),
+            finish_chunk(json!([{"text": "**Bold**"}]), "STOP"),
+        ]);
+        assert_eq!(blocks(&markdown), pairs(&[("text", "****Bold**")]));
         assert_eq!(
             cumulative[0],
             Event::Start {

@@ -190,3 +190,91 @@ async fn image_urls_skip_the_gemini_upstream() {
     up.assert_idle().await;
     let _: Value = json_value(&body);
 }
+
+#[tokio::test]
+async fn codex_to_gemini_streams_and_replays_the_call_signature() {
+    let stream = data_stream(&[
+        json!({"responseId": "r2", "candidates": [{"content": {"role": "model", "parts": [{"text": "plan", "thought": true}]}}]}),
+        json!({"candidates": [{"content": {"role": "model", "parts": [
+            {"functionCall": {"name": "shell", "args": {"command": ["ls"]}}, "thoughtSignature": "SIG-2"},
+            {"functionCall": {"name": "shell", "args": {"command": ["pwd"]}}}
+        ]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 9, "candidatesTokenCount": 4, "totalTokenCount": 13}}),
+    ]);
+    let mut up = Upstream::start(sse_response(&stream, 6)).await;
+    let (addr, _stop) =
+        start_relay_for(Interface::OpenaiResponses, vec![gemini_upstream(&up.url())]).await;
+    let tools = json!([{"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}}]);
+    let request = json!({
+        "model": "gpt-5-codex", "stream": true, "store": false,
+        "reasoning": {"effort": "low"}, "tools": tools, "parallel_tool_calls": true,
+        "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "where am i"}]}]
+    });
+    let (status, _, body) = send_responses(addr, &request).await;
+    let (target, _, _) = up.next().await;
+    assert_eq!(
+        target,
+        "/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse"
+    );
+    assert_eq!(status, 200);
+    let (_, response) = parse_responses_stream(&body);
+    let output = response["output"].as_array().unwrap().clone();
+    let kinds: Vec<&str> = output.iter().map(|i| i["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["reasoning", "reasoning", "function_call", "function_call"]
+    );
+    assert_eq!(output[0]["summary"][0]["text"], "plan");
+    assert!(output[1]["encrypted_content"]
+        .as_str()
+        .unwrap()
+        .starts_with("ccsw1.gemini."));
+    let call_ids: Vec<String> = output[2..]
+        .iter()
+        .map(|i| i["call_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_ne!(call_ids[0], call_ids[1], "generated call ids are unique");
+
+    // 第二轮：Codex 带回全部输出项与两个工具结果
+    let mut up2 = Upstream::start(json_response(
+        "200 OK",
+        &json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "/home"}]}, "finishReason": "STOP"}]}),
+    ))
+    .await;
+    let (addr2, _stop2) = start_relay_for(
+        Interface::OpenaiResponses,
+        vec![gemini_upstream(&up2.url())],
+    )
+    .await;
+    let mut input = request["input"].as_array().unwrap().clone();
+    input.extend(output.iter().cloned());
+    for (id, out) in call_ids.iter().zip(["a.txt", "/home"]) {
+        input.push(json!({"type": "function_call_output", "call_id": id, "output": out}));
+    }
+    let second = json!({"model": "gpt-5-codex", "stream": false, "store": false, "tools": tools, "input": input});
+    let (status, _, body) = send_responses(addr2, &second).await;
+    let (_, _, sent) = up2.next().await;
+    assert_eq!(status, 200);
+    let model_parts = sent["contents"][1]["parts"].as_array().unwrap();
+    let calls: Vec<&Value> = model_parts
+        .iter()
+        .filter(|p| p.get("functionCall").is_some())
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["thoughtSignature"], "SIG-2");
+    assert!(calls[1].get("thoughtSignature").is_none());
+    assert!(
+        calls.iter().all(|c| c["functionCall"].get("id").is_none()),
+        "generated ids are not sent back"
+    );
+    let responses: Vec<&str> = sent["contents"][2]["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["functionResponse"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(responses, ["shell", "shell"]);
+    assert_eq!(
+        json_value(&body)["output"][0]["content"][0]["text"],
+        "/home"
+    );
+}

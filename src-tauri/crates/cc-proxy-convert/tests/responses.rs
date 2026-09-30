@@ -498,3 +498,36 @@ async fn responses_identity_through_the_relay() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn codex_streaming_request_answered_with_json_becomes_a_responses_stream() {
+    let mut up = Upstream::start(json_response(
+        "200 OK",
+        &json!({"id": "chatcmpl-9", "choices": [{"index": 0, "finish_reason": "length",
+            "message": {"role": "assistant", "content": "partial"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2}}),
+    ))
+    .await;
+    let (addr, _stop) = start_relay_for(
+        Interface::OpenaiResponses,
+        vec![upstream_with(
+            "chat",
+            &up.url(),
+            Some(Interface::OpenaiChat),
+            &[],
+        )],
+    )
+    .await;
+    let (status, headers, body) = send_responses(addr, &codex_request(true)).await;
+    up.next().await;
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+    let (names, response) = parse_responses_stream(&body);
+    assert_eq!(names.last().map(String::as_str), Some("response.completed"));
+    assert_eq!(response["status"], "incomplete");
+    assert_eq!(
+        response["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+    assert_eq!(response["output"][0]["content"][0]["text"], "partial");
+}

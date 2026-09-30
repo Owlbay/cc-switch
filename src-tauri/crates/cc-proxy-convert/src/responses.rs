@@ -365,29 +365,41 @@ fn tool_output(output: Option<&Value>) -> Result<Vec<Block>, ParseError> {
     })
 }
 
-/// reasoning 项 → Thinking / RedactedThinking（§5.5）；既无签名又无摘要时丢弃
+/// reasoning 项 → Thinking / RedactedThinking（§5.5）；既无签名又无文本时丢弃。
+/// 文本取 summary；summary 为空时退回 content 中的原文推理（reasoning_text）
 fn parse_reasoning_item(item: &Value) -> Option<Block> {
-    let text = item
-        .get("summary")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let joined = |key: &str| {
+        item.get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let mut text = joined("summary");
+    if text.is_empty() {
+        text = joined("content");
+    }
     let signature = item
         .get("encrypted_content")
         .and_then(Value::as_str)
         .filter(|raw| !raw.is_empty())
-        .map(|raw| {
-            // 本中转的封套按封套来源还原，否则视为来自 Responses 本身（值为整个 reasoning 项）
-            envelope::looks_like(raw)
-                .then(|| envelope::decode(raw))
-                .flatten()
-                .unwrap_or_else(|| Signature {
+        .and_then(|raw| {
+            // 本中转的封套按封套来源还原，否则视为来自 Responses 本身（值为整个 reasoning 项）；
+            // 形似封套却解码失败按“缺签名”处理（§5.5）
+            if envelope::looks_like(raw) {
+                let decoded = envelope::decode(raw);
+                if decoded.is_none() {
+                    tracing::warn!("无法解码的签名封套，按缺签名处理");
+                }
+                decoded
+            } else {
+                Some(Signature {
                     source: Interface::OpenaiResponses,
                     value: item.clone(),
                 })
+            }
         });
     match (signature, text.is_empty()) {
         (signature, false) => Some(Block::Thinking { text, signature }),
@@ -1536,15 +1548,27 @@ mod tests {
             parse_reasoning_item(&item),
             Some(Block::RedactedThinking { signature })
         );
-        // 形似封套但解码失败：按 Responses 原值处理
+        // 形似封套但解码失败：按缺签名处理，不原样回放
         let item = json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "x"}], "encrypted_content": "ccsw1.claude.!!!"});
-        match parse_reasoning_item(&item) {
+        assert_eq!(
+            parse_reasoning_item(&item),
             Some(Block::Thinking {
-                signature: Some(signature),
-                ..
-            }) => assert_eq!(signature.source, Interface::OpenaiResponses),
-            other => panic!("{other:?}"),
-        }
+                text: "x".into(),
+                signature: None
+            })
+        );
+        let item =
+            json!({"type": "reasoning", "summary": [], "encrypted_content": "ccsw2.claude.e30"});
+        assert_eq!(parse_reasoning_item(&item), None);
+        // summary 为空时取 content 中的原文推理
+        let item = json!({"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "raw"}]});
+        assert_eq!(
+            parse_reasoning_item(&item),
+            Some(Block::Thinking {
+                text: "raw".into(),
+                signature: None
+            })
+        );
     }
 
     #[test]

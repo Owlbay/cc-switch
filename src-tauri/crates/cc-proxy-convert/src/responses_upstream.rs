@@ -91,13 +91,13 @@ pub fn render_request(request: &Request, options: &RenderOptions<'_>) -> Result<
     if let Some(user) = &request.user {
         body.insert("user".into(), json!(user));
     }
-    // Disabled 对应的 `effort: none` 只有部分模型支持，统一不写，由上游决定
-    if !matches!(request.reasoning, Reasoning::Disabled) {
+    // Disabled 对应的 `effort: none` 只有部分模型支持，统一不写，由上游决定；
+    // 只对支持推理的模型族下发，其他模型（gpt-4.1 等）会整请求拒绝该字段
+    if !matches!(request.reasoning, Reasoning::Disabled)
+        && crate::chat::supports_reasoning_effort(options.upstream_model)
+    {
         if let Some(effort) = request.reasoning.effort() {
-            body.insert(
-                "reasoning".into(),
-                json!({ "effort": effort.as_str(), "summary": "auto" }),
-            );
+            body.insert("reasoning".into(), json!({ "effort": effort.as_str() }));
         }
     }
     body.insert("stream".into(), json!(request.stream));
@@ -969,7 +969,19 @@ impl StreamDecoder {
                                 partial_json: final_arguments,
                             });
                         }
+                    } else if let Some(rest) = final_arguments
+                        .strip_prefix(state.emitted_arguments.as_str())
+                        .filter(|rest| !rest.is_empty())
+                    {
+                        // done 以已输出内容为前缀（delta 丢了尾部）：以 done 为准补发剩余部分
+                        let rest = rest.to_string();
+                        state.emitted_arguments = final_arguments;
+                        out.push(Event::ToolArgumentsDelta {
+                            index,
+                            partial_json: rest,
+                        });
                     } else if state.emitted_arguments != final_arguments {
+                        // 已输出的片段无法撤回
                         tracing::warn!(
                             tool = %state.name,
                             "Responses 流中工具参数 delta 与 done 不一致，保留已输出的内容"
@@ -1184,10 +1196,16 @@ mod tests {
                 None => assert!(body.get("reasoning").is_none(), "{reasoning:?}"),
                 Some(effort) => assert_eq!(
                     body["reasoning"],
-                    json!({"effort": effort, "summary": "auto"}),
+                    json!({"effort": effort}),
                     "{reasoning:?}"
                 ),
             }
+        }
+        // 不支持推理的模型族不写 reasoning
+        req.reasoning = Reasoning::Effort(Effort::High);
+        for model in ["gpt-4.1", "gpt-4o-mini", "qwen3-coder"] {
+            let body = render_request(&req, &opts(model)).unwrap();
+            assert!(body.get("reasoning").is_none(), "{model}");
         }
     }
 
@@ -1938,6 +1956,34 @@ mod tests {
             })
             .collect();
         assert_eq!(arguments, vec!["{\"x\":1}"]);
+    }
+
+    #[test]
+    fn stream_done_completes_truncated_arguments() {
+        let events = decode(&[
+            created(),
+            ev(
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"type": "function_call", "call_id": "c", "name": "A"}}),
+            ),
+            ev(
+                "response.function_call_arguments.delta",
+                json!({"output_index": 0, "delta": "{\"x\":"}),
+            ),
+            ev(
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"type": "function_call", "call_id": "c", "name": "A", "arguments": "{\"x\":1}"}}),
+            ),
+            completed(json!([])),
+        ]);
+        let arguments: String = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ToolArgumentsDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arguments, "{\"x\":1}");
     }
 
     #[test]
