@@ -31,7 +31,9 @@ impl Converter for IrConverter {
     fn supports(&self, client: Interface, upstream: Interface) -> bool {
         matches!(
             (client, upstream),
-            (Interface::Claude, Interface::Claude) | (Interface::Claude, Interface::OpenaiChat)
+            (Interface::Claude, Interface::Claude)
+                | (Interface::Claude, Interface::OpenaiChat)
+                | (Interface::OpenaiResponses, Interface::OpenaiResponses)
         )
     }
 
@@ -213,22 +215,57 @@ impl IdentityResponse {
         events
             .into_iter()
             .map(|event| {
-                let data = if event.event.as_deref() == Some("message_start")
-                    && !self.client_model.is_empty()
-                {
-                    match serde_json::from_str::<Value>(&event.data) {
-                        Ok(mut value) if value.pointer("/message/model").is_some() => {
-                            value["message"]["model"] = Value::String(self.client_model.clone());
-                            value.to_string()
-                        }
-                        _ => event.data,
-                    }
-                } else {
-                    event.data
-                };
+                let data = self.rewrite_model(event.event.as_deref(), event.data);
                 sse::frame(event.event.as_deref(), &data)
             })
             .collect()
+    }
+
+    /// 流式事件中的模型名：Anthropic 只在 `message_start.message.model`；Responses 的
+    /// `response.*` 生命周期事件都带完整 response 对象（`response.model`）
+    fn rewrite_model(&self, event: Option<&str>, data: String) -> String {
+        if self.client_model.is_empty() {
+            return data;
+        }
+        let pointer = match (self.protocol, event) {
+            (Interface::Claude, Some("message_start")) => "/message/model",
+            (Interface::OpenaiResponses, Some(name)) if name.starts_with("response.") => {
+                "/response/model"
+            }
+            _ => return data,
+        };
+        match serde_json::from_str::<Value>(&data) {
+            Ok(mut value) if value.pointer(pointer).is_some() => {
+                *value.pointer_mut(pointer).expect("checked above") =
+                    Value::String(self.client_model.clone());
+                value.to_string()
+            }
+            _ => data,
+        }
+    }
+
+    /// 内层出错时补发的客户端协议错误帧
+    fn error_frame(&self, message: &str) -> Option<Bytes> {
+        match self.protocol {
+            Interface::Claude => Some(sse::frame(
+                Some("error"),
+                &anthropic::error_body("api_error", message).to_string(),
+            )),
+            Interface::OpenaiResponses => Some(sse::frame(
+                Some("response.failed"),
+                &serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "object": "response",
+                        "status": "failed",
+                        "model": self.client_model,
+                        "error": { "code": "server_error", "message": message },
+                    }
+                })
+                .to_string(),
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -260,11 +297,8 @@ impl ResponseConverter for IdentityResponse {
         }
         let events = self.parser.finish();
         let mut out = self.reframe(events);
-        if let (Some(error), Interface::Claude) = (error, self.protocol) {
-            out.push(sse::frame(
-                Some("error"),
-                &anthropic::error_body("api_error", &error.to_string()).to_string(),
-            ));
+        if let Some(frame) = error.and_then(|error| self.error_frame(&error.to_string())) {
+            out.push(frame);
         }
         out
     }
@@ -453,7 +487,7 @@ mod tests {
         assert!(c.supports(Interface::Claude, Interface::Claude));
         assert!(c.supports(Interface::Claude, Interface::OpenaiChat));
         assert!(!c.supports(Interface::Claude, Interface::Gemini));
-        assert!(!c.supports(Interface::OpenaiResponses, Interface::Claude));
+        assert!(c.supports(Interface::OpenaiResponses, Interface::OpenaiResponses));
     }
 
     #[test]
@@ -601,5 +635,53 @@ mod tests {
             response.convert_full(StatusCode::OK, br#"{"error":{"message":"inside 200"}}"#),
             Err(ConvertError::Response(_))
         ));
+    }
+
+    #[test]
+    fn responses_identity_rewrites_every_lifecycle_event() {
+        let map = ModelMap::from([("gpt-5-codex".to_string(), "gpt-5.1-codex".to_string())]);
+        let body = Bytes::from(
+            json!({"model": "gpt-5-codex", "stream": true, "store": false, "input": "hi"})
+                .to_string(),
+        );
+        let headers = HeaderMap::new();
+        let method = Method::POST;
+        let c = ctx(Interface::OpenaiResponses, Interface::OpenaiResponses, &map);
+        let out = IrConverter
+            .convert_request(&c, &inbound(&method, "/v1/responses", &headers, &body))
+            .unwrap();
+        let sent: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(
+            sent,
+            json!({"model": "gpt-5.1-codex", "stream": true, "store": false, "input": "hi"})
+        );
+
+        let mut response = IrConverter.response_converter(&c, &out.meta);
+        let frames = response
+            .feed(concat!(
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.1-codex\"}}\n\n",
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"gpt-5.1-codex\"}\n\n",
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.1-codex\"}}\n\n",
+            ).as_bytes())
+            .unwrap();
+        let text: String = frames
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect();
+        assert_eq!(
+            text.matches("\"model\":\"gpt-5-codex\"").count(),
+            2,
+            "{text}"
+        );
+        assert!(
+            text.contains("\"delta\":\"gpt-5.1-codex\""),
+            "text content is untouched"
+        );
+
+        let error = std::io::Error::other("upstream reset");
+        let tail = response.finish(Some(&error));
+        let tail = String::from_utf8_lossy(&tail[0]).into_owned();
+        assert!(tail.starts_with("event: response.failed\n"), "{tail}");
+        assert!(tail.contains("upstream reset"));
     }
 }
