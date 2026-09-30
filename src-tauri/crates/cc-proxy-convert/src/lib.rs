@@ -12,6 +12,7 @@ pub mod anthropic;
 pub mod chat;
 pub mod envelope;
 pub mod ir;
+pub mod responses;
 pub mod sse;
 
 use bytes::Bytes;
