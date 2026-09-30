@@ -1,0 +1,10 @@
+data: {"candidates": [{"content": {"parts": [{"text": "用户想看目录，","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 21594,"totalTokenCount": 21594},"modelVersion": "gemini-3-pro-preview","responseId": "xYzA"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "先运行 ls。","thought": true}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 21594,"totalTokenCount": 21594},"modelVersion": "gemini-3-pro-preview","responseId": "xYzA"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "我先看一下"}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 21594,"totalTokenCount": 21594},"modelVersion": "gemini-3-pro-preview","responseId": "xYzA"}
+
+data: {"candidates": [{"content": {"parts": [{"text": "当前目录。"}],"role": "model"},"index": 0}],"usageMetadata": {"promptTokenCount": 21594,"totalTokenCount": 21594},"modelVersion": "gemini-3-pro-preview","responseId": "xYzA"}
+
+data: {"candidates": [{"content": {"parts": [{"functionCall": {"name": "Bash","args": {"command": "ls -la","description": "列出文件"}},"thoughtSignature": "CiQBMockThoughtSignatureForFixture"}],"role": "model"},"finishReason": "STOP","index": 0}],"usageMetadata": {"promptTokenCount": 21594,"candidatesTokenCount": 75,"totalTokenCount": 21681,"cachedContentTokenCount": 18342,"thoughtsTokenCount": 12},"modelVersion": "gemini-3-pro-preview","responseId": "xYzA"}
+

@@ -1,0 +1,22 @@
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":""},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":null,"reasoning_content":"用户想看目录，"},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":null,"reasoning_content":"先运行 ls。"},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":"我先看一下","reasoning_content":null},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":"当前目录。"},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_00_x1","type":"function","function":{"name":"Bash","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\": \"ls -la\", "}}]},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"description\": \"列出文件\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":""},"finish_reason":"tool_calls"}]}
+
+data: {"id":"8f1c","object":"chat.completion.chunk","created":1759200000,"model":"deepseek-reasoner","choices":[],"usage":{"prompt_tokens":21594,"completion_tokens":87,"total_tokens":21681,"prompt_tokens_details":{"cached_tokens":18342},"completion_tokens_details":{"reasoning_tokens":12}}}
+
+data: [DONE]
+
