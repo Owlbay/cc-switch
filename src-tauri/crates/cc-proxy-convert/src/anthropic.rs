@@ -401,6 +401,17 @@ fn block_json(block: &Block) -> Option<Value> {
     })
 }
 
+/// 消息 id：统一 `msg_` 前缀（与 Responses 侧的 `resp_` 对称）；上游没给 id 时用 `msg_relay`
+fn message_id(id: &str) -> String {
+    if id.is_empty() {
+        "msg_relay".to_string()
+    } else if id.starts_with("msg_") {
+        id.to_string()
+    } else {
+        format!("msg_{id}")
+    }
+}
+
 /// IR 响应 → Anthropic Messages 响应；`model` 用客户端请求的模型名
 pub fn render_response(response: &Response, client_model: &str) -> Value {
     let searches = response
@@ -409,7 +420,7 @@ pub fn render_response(response: &Response, client_model: &str) -> Value {
         .filter(|block| matches!(block, Block::ServerToolUse { .. }))
         .count() as u64;
     json!({
-        "id": response.id,
+        "id": message_id(&response.id),
         "type": "message",
         "role": "assistant",
         "model": client_model,
@@ -463,7 +474,7 @@ impl StreamEncoder {
             json!({
                 "type": "message_start",
                 "message": {
-                    "id": id,
+                    "id": message_id(id),
                     "type": "message",
                     "role": "assistant",
                     "model": self.client_model,
@@ -484,7 +495,7 @@ impl StreamEncoder {
         match event {
             Event::Start { id, usage, .. } => self.ensure_started(&mut out, &id, &usage),
             Event::BlockStart { index, kind } => {
-                self.ensure_started(&mut out, "msg_relay", &Usage::default());
+                self.ensure_started(&mut out, "", &Usage::default());
                 let block = match kind {
                     BlockKind::Text => json!({ "type": "text", "text": "" }),
                     BlockKind::Thinking => json!({ "type": "thinking", "thinking": "" }),
@@ -567,7 +578,7 @@ impl StreamEncoder {
                 );
             }
             Event::Finish { stop_reason, usage } => {
-                self.ensure_started(&mut out, "msg_relay", &Usage::default());
+                self.ensure_started(&mut out, "", &Usage::default());
                 Self::emit(
                     &mut out,
                     "message_delta",
@@ -1794,6 +1805,14 @@ impl StreamDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_ids_carry_the_msg_prefix() {
+        assert_eq!(message_id("msg_01XyZ"), "msg_01XyZ");
+        assert_eq!(message_id("chatcmpl-8f1c"), "msg_chatcmpl-8f1c");
+        assert_eq!(message_id("resp_68d9"), "msg_resp_68d9");
+        assert_eq!(message_id(""), "msg_relay");
+    }
 
     fn claude_code_request() -> Value {
         json!({

@@ -93,6 +93,8 @@ fn identity_request(
     };
     let mut headers = request.headers.clone();
     headers.remove(header::CONTENT_LENGTH);
+    // 恒等转换同样要解析响应（改写 model）：不协商压缩（§8.4）
+    headers.remove(header::ACCEPT_ENCODING);
     Ok(OutboundRequest {
         method: request.method.clone(),
         path: request.path.to_string(),
@@ -293,7 +295,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
         let bytes = Bytes::from(body.to_string());
-        let headers = HeaderMap::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
         let method = Method::POST;
         let out = IrConverter
             .convert_request(
@@ -307,6 +310,7 @@ mod tests {
         assert_eq!(sent, expected);
         assert_eq!(out.path, "/v1/messages");
         assert_eq!(out.query.as_deref(), Some("beta=true"));
+        assert!(out.headers.get(header::ACCEPT_ENCODING).is_none());
         assert!(out.meta.stream);
         assert_eq!(out.meta.client_model, "claude-sonnet-5");
 
@@ -356,6 +360,10 @@ mod tests {
         headers.insert("anthropic-beta", HeaderValue::from_static("x"));
         headers.insert("user-agent", HeaderValue::from_static("claude-cli"));
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("99"));
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
         let method = Method::POST;
         let out = IrConverter
             .convert_request(
@@ -368,6 +376,7 @@ mod tests {
         assert!(out.headers.get("anthropic-version").is_none());
         assert!(out.headers.get("anthropic-beta").is_none());
         assert!(out.headers.get(header::CONTENT_LENGTH).is_none());
+        assert!(out.headers.get(header::ACCEPT_ENCODING).is_none());
         assert_eq!(out.headers["user-agent"], "claude-cli");
         let sent: Value = serde_json::from_slice(&out.body).unwrap();
         assert_eq!(sent["model"], "deepseek-chat");

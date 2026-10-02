@@ -151,6 +151,8 @@ pub fn convert_request(
     .map_err(ConvertError::Unsupported)?;
 
     let mut headers = strip_headers(request.headers, client_header_prefixes(ctx.client));
+    // 响应要被解析：不协商压缩（§8.4）
+    headers.remove(header::ACCEPT_ENCODING);
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
