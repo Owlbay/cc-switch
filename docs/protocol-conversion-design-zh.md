@@ -586,6 +586,7 @@ pub enum ConvertError {
 | X12 | 流式边界（§6.2）：Chat usage chunk 在 finish_reason 之后、重复 finish_reason、arguments 先于 id、`reasoning_content: ""`；Gemini 累计快照、functionCall 重复片段、签名只在某片段；`ConvertingBody` 在内层结束后仍能发出 `finish()` 的帧，`size_hint` 未知，内层 trailers 被丢弃，`feed` 出错时先发错误帧再 `Err` |
 | X13 | 恒等转换：同协议 + `model_map` 只改模型名，其余 IR 覆盖字段不变（含 `thinking: {type: adaptive}` + `output_config` 原样回放）；未配置 `model_map` 时仍走透传（X8） |
 | X14 | Codex 常见请求形态：`apply_patch` custom 工具 + `reasoning` + 并行调用的多轮对话分别对 Anthropic / Chat / Gemini 上游成功，响应中的 `apply_patch` 调用还原为 `custom_tool_call`；未带 `max_output_tokens` 时上游收到 `default_max_output_tokens` |
+| X15 | 输出快照（golden）：固定输入经全部 8 个方向的请求、非流式响应、流式事件与 429 错误体后的完整输出，与仓库快照逐字节一致；生成的 id、时间戳规范化，签名封套解码后比较。守护输出形态（字段、键序、事件序列、头），与 X4 的语义等价互补 |
 
 **实现状态（C5 后，基线 `4c7b092e5`）**。单元测试在各模块的 `#[cfg(test)]`，端到端测试在 `cc-proxy-convert/tests/`（mock 上游与客户端都用原始 TCP 字节，`tests/support/mod.rs`），core 集成在 `cc-proxy-core/tests/conversion_hook.rs`：
 
@@ -603,6 +604,7 @@ pub enum ConvertError {
 | X12 | Chat 项：`chat.rs` 的 `stream_text_reasoning_tools_and_late_usage` / `interleaved_tool_arguments_are_not_lost` / `stream_without_done_still_finishes_and_truncation_is_an_error`；Gemini 项：`gemini.rs` 的 `stream_incremental_and_cumulative_text` / `stream_function_calls_are_deduplicated_and_late_signatures_attached` / `stream_signature_on_call_precedes_the_tool_block` / `stream_usage_after_finish_and_truncation`；Responses 项：`responses_upstream.rs` 的 `stream_function_call_arguments_only_in_done` / `stream_mismatched_done_keeps_emitted_arguments` / `stream_done_completes_truncated_arguments` / `stream_incomplete_closes_open_blocks`；`ConvertingBody` 项在 core（C1） | — |
 | X13 | `tests/claude_chat.rs::identity_*`（含 `thinking: adaptive` + `output_config` 原样、流式只改 `message_start`、JSON 回退保留 JSON）、`tests/responses.rs::responses_identity_through_the_relay`、`lib.rs` 单元测试 | — |
 | X14 | **部分**：`tests/responses.rs::codex_to_chat_restores_custom_tool_calls`（`apply_patch` + `reasoning` + `parallel_tool_calls`，断言 `default_max_output_tokens`）、`tests/gemini.rs::codex_to_gemini_non_streaming_with_custom_tool`；Anthropic 方向的 Codex 请求形态由 `codex_to_anthropic_streams_and_replays_thinking` 覆盖 | Anthropic 上游方向没有 `apply_patch` 还原为 `custom_tool_call` 的端到端断言；并行调用的多轮对话没有端到端用例 |
+| X15 | `tests/golden.rs` + `tests/golden/{request,response,stream,error}/`（32 份快照）：请求输入为 Claude Code / Codex CLI 形态（含跨来源签名封套、图片、custom 与内置搜索工具），响应输入为 `tests/fixtures/*.json` 与 `*.sse`。有意修改后以 `UPDATE_GOLDEN=1 cargo test -p cc-proxy-convert --test golden` 重新生成并审查 diff | — |
 
 ## 11. 分阶段实施
 
