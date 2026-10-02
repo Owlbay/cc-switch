@@ -1,0 +1,43 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "id": "msg_01XyZ",
+    "type": "message",
+    "role": "assistant",
+    "model": "client-model",
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": "用户想看目录，先运行 ls。",
+        "signature": "EqQBCkgIBxABGAIiQMockSignatureForFixture=="
+      },
+      {
+        "type": "text",
+        "text": "我先看一下当前目录。"
+      },
+      {
+        "type": "tool_use",
+        "id": "toolu_01AbC",
+        "name": "Bash",
+        "input": {
+          "command": "ls -la",
+          "description": "列出文件"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1204,
+      "cache_creation_input_tokens": 2048,
+      "cache_read_input_tokens": 18342,
+      "output_tokens": 87
+    }
+  }
+}

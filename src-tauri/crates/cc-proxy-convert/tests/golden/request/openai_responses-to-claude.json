@@ -1,0 +1,183 @@
+{
+  "method": "POST",
+  "path": "/v1/messages",
+  "query": null,
+  "headers": [
+    [
+      "accept",
+      "text/event-stream"
+    ],
+    [
+      "anthropic-version",
+      "2023-06-01"
+    ],
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "originator",
+      "codex_cli_rs"
+    ],
+    [
+      "session_id",
+      "session-1"
+    ],
+    [
+      "user-agent",
+      "codex_cli_rs/0.50.0"
+    ]
+  ],
+  "body": {
+    "model": "upstream-model",
+    "max_tokens": 16384,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are Codex."
+      },
+      {
+        "type": "text",
+        "text": "Be brief."
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "修复 bug"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "需要先看文件",
+            "signature": "EqQBPrevClaudeSignature=="
+          },
+          {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "shell",
+            "input": {
+              "command": [
+                "ls"
+              ]
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": [
+              {
+                "type": "text",
+                "text": "a.txt"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "tool_use",
+            "id": "call_2",
+            "name": "apply_patch",
+            "input": {
+              "input": "*** Begin Patch\n*** End Patch"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call_2",
+            "content": [
+              {
+                "type": "text",
+                "text": "Done!"
+              }
+            ]
+          },
+          {
+            "type": "text",
+            "text": "继续"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "name": "shell",
+        "description": "Run a command",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "apply_patch",
+        "description": "Apply a patch",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      },
+      {
+        "type": "web_search_20250305",
+        "name": "web_search"
+      }
+    ],
+    "tool_choice": {
+      "type": "auto"
+    },
+    "thinking": {
+      "type": "disabled"
+    },
+    "stream": true
+  },
+  "meta": {
+    "stream": true,
+    "client_model": "gpt-5-codex",
+    "upstream_model": "upstream-model",
+    "tool_names": [
+      "shell",
+      "apply_patch"
+    ],
+    "custom_tool_names": [
+      "apply_patch"
+    ],
+    "hosted_web_search": "web_search"
+  }
+}

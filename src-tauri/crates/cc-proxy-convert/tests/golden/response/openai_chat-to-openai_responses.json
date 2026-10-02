@@ -1,0 +1,61 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "id": "resp_8f1c",
+    "object": "response",
+    "created_at": 0,
+    "status": "completed",
+    "model": "client-model",
+    "output": [
+      {
+        "id": "rs_8f1c_0",
+        "type": "reasoning",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "用户想看目录，先运行 ls。"
+          }
+        ]
+      },
+      {
+        "id": "msg_8f1c_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "我先看一下当前目录。",
+            "annotations": []
+          }
+        ]
+      },
+      {
+        "id": "fc_call_00_x1",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_00_x1",
+        "name": "Bash",
+        "arguments": "{\"command\": \"ls -la\", \"description\": \"列出文件\"}"
+      }
+    ],
+    "usage": {
+      "input_tokens": 21594,
+      "input_tokens_details": {
+        "cached_tokens": 18342
+      },
+      "output_tokens": 87,
+      "output_tokens_details": {
+        "reasoning_tokens": 12
+      },
+      "total_tokens": 21681
+    },
+    "incomplete_details": null
+  }
+}

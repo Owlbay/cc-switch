@@ -1,0 +1,62 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "id": "resp_msg_01XyZ",
+    "object": "response",
+    "created_at": 0,
+    "status": "completed",
+    "model": "client-model",
+    "output": [
+      {
+        "id": "rs_msg_01XyZ_0",
+        "type": "reasoning",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "用户想看目录，先运行 ls。"
+          }
+        ],
+        "encrypted_content": "ccsw1.claude.decoded:{\"block\":{\"type\":\"thinking\",\"thinking\":\"用户想看目录，先运行 ls。\",\"signature\":\"EqQBCkgIBxABGAIiQMockSignatureForFixture==\"}}"
+      },
+      {
+        "id": "msg_msg_01XyZ_1",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "我先看一下当前目录。",
+            "annotations": []
+          }
+        ]
+      },
+      {
+        "id": "fc_toolu_01AbC",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "toolu_01AbC",
+        "name": "Bash",
+        "arguments": "{\"command\":\"ls -la\",\"description\":\"列出文件\"}"
+      }
+    ],
+    "usage": {
+      "input_tokens": 21594,
+      "input_tokens_details": {
+        "cached_tokens": 18342
+      },
+      "output_tokens": 87,
+      "output_tokens_details": {
+        "reasoning_tokens": 0
+      },
+      "total_tokens": 21681
+    },
+    "incomplete_details": null
+  }
+}

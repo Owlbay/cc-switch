@@ -1,0 +1,156 @@
+{
+  "method": "POST",
+  "path": "/v1/responses",
+  "query": null,
+  "headers": [
+    [
+      "accept",
+      "text/event-stream"
+    ],
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "openai-beta",
+      "responses=experimental"
+    ],
+    [
+      "originator",
+      "codex_cli_rs"
+    ],
+    [
+      "session_id",
+      "session-1"
+    ],
+    [
+      "user-agent",
+      "codex_cli_rs/0.50.0"
+    ]
+  ],
+  "body": {
+    "model": "upstream-model",
+    "instructions": "You are Codex.",
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "prompt_cache_key": "session-1",
+    "reasoning": {
+      "effort": "high",
+      "summary": "auto"
+    },
+    "tools": [
+      {
+        "type": "function",
+        "name": "shell",
+        "description": "Run a command",
+        "strict": false,
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch",
+        "format": {
+          "type": "grammar",
+          "syntax": "lark",
+          "definition": "start: /.+/"
+        }
+      },
+      {
+        "type": "web_search"
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "input": [
+      {
+        "type": "message",
+        "role": "developer",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Be brief."
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "修复 bug"
+          }
+        ]
+      },
+      {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "需要先看文件"
+          }
+        ],
+        "encrypted_content": "ccsw1.claude.decoded:{\"block\":{\"type\":\"thinking\",\"thinking\":\"需要先看文件\",\"signature\":\"EqQBPrevClaudeSignature==\"}}"
+      },
+      {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "shell",
+        "arguments": "{\"command\":[\"ls\"]}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "a.txt"
+      },
+      {
+        "type": "custom_tool_call",
+        "call_id": "call_2",
+        "name": "apply_patch",
+        "input": "*** Begin Patch\n*** End Patch"
+      },
+      {
+        "type": "custom_tool_call_output",
+        "call_id": "call_2",
+        "output": "Done!"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "继续"
+          }
+        ]
+      }
+    ]
+  },
+  "meta": {
+    "stream": true,
+    "client_model": "gpt-5-codex",
+    "upstream_model": "upstream-model",
+    "tool_names": [],
+    "custom_tool_names": [],
+    "hosted_web_search": null
+  }
+}

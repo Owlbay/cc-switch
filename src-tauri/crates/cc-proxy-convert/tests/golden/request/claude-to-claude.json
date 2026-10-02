@@ -1,0 +1,176 @@
+{
+  "method": "POST",
+  "path": "/v1/messages",
+  "query": "beta=true",
+  "headers": [
+    [
+      "anthropic-beta",
+      "claude-code-20250219,interleaved-thinking-2025-05-14"
+    ],
+    [
+      "anthropic-version",
+      "2023-06-01"
+    ],
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "user-agent",
+      "claude-cli/2.1.0 (external, cli)"
+    ],
+    [
+      "x-claude-code-session-id",
+      "session-1"
+    ]
+  ],
+  "body": {
+    "model": "upstream-model",
+    "max_tokens": 8192,
+    "stream": true,
+    "system": [
+      {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.0; cch=9;"
+      },
+      {
+        "type": "text",
+        "text": "You are Claude Code.",
+        "cache_control": {
+          "type": "ephemeral"
+        }
+      }
+    ],
+    "metadata": {
+      "user_id": "user_abc_session_1"
+    },
+    "thinking": {
+      "type": "enabled",
+      "budget_tokens": 4096
+    },
+    "tools": [
+      {
+        "name": "Bash",
+        "description": "Run a shell command",
+        "input_schema": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "type": "web_search_20250305",
+        "name": "web_search",
+        "max_uses": 5
+      }
+    ],
+    "tool_choice": {
+      "type": "auto"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "列出文件并看一下这张图"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "aGVsbG8="
+            }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "先列目录",
+            "signature": "ccsw1.openai_responses.decoded:{\"item\":{\"id\":\"rs_prev\",\"type\":\"reasoning\",\"encrypted_content\":\"gAAAAABoPrevEncrypted\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"先列目录\"}]}}"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_1",
+            "name": "Bash",
+            "input": {
+              "command": "ls"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [
+              {
+                "type": "text",
+                "text": "a.txt\nb.png"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "redacted_thinking",
+            "data": "ccsw1.gemini.decoded:{\"sig\":\"CiQBPrevThoughtSignature\",\"call_id\":\"toolu_2\"}"
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_2",
+            "name": "Bash",
+            "input": {
+              "command": "cat a.txt"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_2",
+            "content": "hello"
+          },
+          {
+            "type": "text",
+            "text": "继续",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "meta": {
+    "stream": true,
+    "client_model": "claude-sonnet-5",
+    "upstream_model": "upstream-model",
+    "tool_names": [],
+    "custom_tool_names": [],
+    "hosted_web_search": null
+  }
+}

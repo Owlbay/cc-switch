@@ -1,0 +1,354 @@
+{
+  "headers": [
+    [
+      "content-type",
+      "text/event-stream"
+    ]
+  ],
+  "events": [
+    {
+      "event": "response.created",
+      "data": {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+          "id": "resp_68d9",
+          "object": "response",
+          "created_at": 0,
+          "status": "in_progress",
+          "model": "client-model",
+          "output": [],
+          "usage": null
+        }
+      }
+    },
+    {
+      "event": "response.in_progress",
+      "data": {
+        "type": "response.in_progress",
+        "sequence_number": 1,
+        "response": {
+          "id": "resp_68d9",
+          "object": "response",
+          "created_at": 0,
+          "status": "in_progress",
+          "model": "client-model",
+          "output": []
+        }
+      }
+    },
+    {
+      "event": "response.output_item.added",
+      "data": {
+        "type": "response.output_item.added",
+        "sequence_number": 2,
+        "output_index": 0,
+        "item": {
+          "id": "rs_68d9a",
+          "type": "reasoning",
+          "summary": []
+        }
+      }
+    },
+    {
+      "event": "response.reasoning_summary_part.added",
+      "data": {
+        "type": "response.reasoning_summary_part.added",
+        "sequence_number": 3,
+        "item_id": "rs_68d9a",
+        "output_index": 0,
+        "summary_index": 0,
+        "part": {
+          "type": "summary_text",
+          "text": ""
+        }
+      }
+    },
+    {
+      "event": "response.reasoning_summary_text.delta",
+      "data": {
+        "type": "response.reasoning_summary_text.delta",
+        "sequence_number": 4,
+        "item_id": "rs_68d9a",
+        "output_index": 0,
+        "summary_index": 0,
+        "delta": "用户想看目录，"
+      }
+    },
+    {
+      "event": "response.reasoning_summary_text.delta",
+      "data": {
+        "type": "response.reasoning_summary_text.delta",
+        "sequence_number": 5,
+        "item_id": "rs_68d9a",
+        "output_index": 0,
+        "summary_index": 0,
+        "delta": "先运行 ls。"
+      }
+    },
+    {
+      "event": "response.reasoning_summary_text.done",
+      "data": {
+        "type": "response.reasoning_summary_text.done",
+        "sequence_number": 6,
+        "item_id": "rs_68d9a",
+        "output_index": 0,
+        "summary_index": 0,
+        "text": "用户想看目录，先运行 ls。"
+      }
+    },
+    {
+      "event": "response.reasoning_summary_part.done",
+      "data": {
+        "type": "response.reasoning_summary_part.done",
+        "sequence_number": 7,
+        "item_id": "rs_68d9a",
+        "output_index": 0,
+        "summary_index": 0,
+        "part": {
+          "type": "summary_text",
+          "text": "用户想看目录，先运行 ls。"
+        }
+      }
+    },
+    {
+      "event": "response.output_item.done",
+      "data": {
+        "type": "response.output_item.done",
+        "sequence_number": 8,
+        "output_index": 0,
+        "item": {
+          "id": "rs_68d9a",
+          "type": "reasoning",
+          "encrypted_content": "gAAAAABo2MockEncryptedContentForFixture",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "用户想看目录，先运行 ls。"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "event": "response.output_item.added",
+      "data": {
+        "type": "response.output_item.added",
+        "sequence_number": 9,
+        "output_index": 1,
+        "item": {
+          "id": "msg_68d9b",
+          "type": "message",
+          "status": "in_progress",
+          "content": [],
+          "role": "assistant"
+        }
+      }
+    },
+    {
+      "event": "response.content_part.added",
+      "data": {
+        "type": "response.content_part.added",
+        "sequence_number": 10,
+        "item_id": "msg_68d9b",
+        "output_index": 1,
+        "content_index": 0,
+        "part": {
+          "type": "output_text",
+          "annotations": [],
+          "text": ""
+        }
+      }
+    },
+    {
+      "event": "response.output_text.delta",
+      "data": {
+        "type": "response.output_text.delta",
+        "sequence_number": 11,
+        "item_id": "msg_68d9b",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "我先看一下"
+      }
+    },
+    {
+      "event": "response.output_text.delta",
+      "data": {
+        "type": "response.output_text.delta",
+        "sequence_number": 12,
+        "item_id": "msg_68d9b",
+        "output_index": 1,
+        "content_index": 0,
+        "delta": "当前目录。"
+      }
+    },
+    {
+      "event": "response.output_text.done",
+      "data": {
+        "type": "response.output_text.done",
+        "sequence_number": 13,
+        "item_id": "msg_68d9b",
+        "output_index": 1,
+        "content_index": 0,
+        "text": "我先看一下当前目录。"
+      }
+    },
+    {
+      "event": "response.content_part.done",
+      "data": {
+        "type": "response.content_part.done",
+        "sequence_number": 14,
+        "item_id": "msg_68d9b",
+        "output_index": 1,
+        "content_index": 0,
+        "part": {
+          "type": "output_text",
+          "annotations": [],
+          "text": "我先看一下当前目录。"
+        }
+      }
+    },
+    {
+      "event": "response.output_item.done",
+      "data": {
+        "type": "response.output_item.done",
+        "sequence_number": 15,
+        "output_index": 1,
+        "item": {
+          "id": "msg_68d9b",
+          "type": "message",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "annotations": [],
+              "text": "我先看一下当前目录。"
+            }
+          ],
+          "role": "assistant"
+        }
+      }
+    },
+    {
+      "event": "response.output_item.added",
+      "data": {
+        "type": "response.output_item.added",
+        "sequence_number": 16,
+        "output_index": 2,
+        "item": {
+          "id": "fc_68d9c",
+          "type": "function_call",
+          "status": "in_progress",
+          "arguments": "",
+          "call_id": "call_Kx1",
+          "name": "Bash"
+        }
+      }
+    },
+    {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+        "type": "response.function_call_arguments.delta",
+        "sequence_number": 17,
+        "item_id": "fc_68d9c",
+        "output_index": 2,
+        "delta": "{\"command\": \"ls -la\", "
+      }
+    },
+    {
+      "event": "response.function_call_arguments.delta",
+      "data": {
+        "type": "response.function_call_arguments.delta",
+        "sequence_number": 18,
+        "item_id": "fc_68d9c",
+        "output_index": 2,
+        "delta": "\"description\": \"列出文件\"}"
+      }
+    },
+    {
+      "event": "response.function_call_arguments.done",
+      "data": {
+        "type": "response.function_call_arguments.done",
+        "sequence_number": 19,
+        "item_id": "fc_68d9c",
+        "output_index": 2,
+        "arguments": "{\"command\": \"ls -la\", \"description\": \"列出文件\"}"
+      }
+    },
+    {
+      "event": "response.output_item.done",
+      "data": {
+        "type": "response.output_item.done",
+        "sequence_number": 20,
+        "output_index": 2,
+        "item": {
+          "id": "fc_68d9c",
+          "type": "function_call",
+          "status": "completed",
+          "arguments": "{\"command\": \"ls -la\", \"description\": \"列出文件\"}",
+          "call_id": "call_Kx1",
+          "name": "Bash"
+        }
+      }
+    },
+    {
+      "event": "response.completed",
+      "data": {
+        "type": "response.completed",
+        "sequence_number": 21,
+        "response": {
+          "id": "resp_68d9",
+          "object": "response",
+          "created_at": 0,
+          "status": "completed",
+          "model": "client-model",
+          "output": [
+            {
+              "id": "rs_68d9a",
+              "type": "reasoning",
+              "encrypted_content": "gAAAAABo2MockEncryptedContentForFixture",
+              "summary": [
+                {
+                  "type": "summary_text",
+                  "text": "用户想看目录，先运行 ls。"
+                }
+              ]
+            },
+            {
+              "id": "msg_68d9b",
+              "type": "message",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "output_text",
+                  "annotations": [],
+                  "text": "我先看一下当前目录。"
+                }
+              ],
+              "role": "assistant"
+            },
+            {
+              "id": "fc_68d9c",
+              "type": "function_call",
+              "status": "completed",
+              "arguments": "{\"command\": \"ls -la\", \"description\": \"列出文件\"}",
+              "call_id": "call_Kx1",
+              "name": "Bash"
+            }
+          ],
+          "usage": {
+            "input_tokens": 21594,
+            "input_tokens_details": {
+              "cached_tokens": 18342
+            },
+            "output_tokens": 87,
+            "output_tokens_details": {
+              "reasoning_tokens": 12
+            },
+            "total_tokens": 21681
+          }
+        }
+      }
+    }
+  ]
+}

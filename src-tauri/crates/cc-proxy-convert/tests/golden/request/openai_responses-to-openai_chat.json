@@ -1,0 +1,144 @@
+{
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "query": null,
+  "headers": [
+    [
+      "accept",
+      "text/event-stream"
+    ],
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "originator",
+      "codex_cli_rs"
+    ],
+    [
+      "session_id",
+      "session-1"
+    ],
+    [
+      "user-agent",
+      "codex_cli_rs/0.50.0"
+    ]
+  ],
+  "body": {
+    "model": "upstream-model",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are Codex.\nBe brief."
+      },
+      {
+        "role": "user",
+        "content": "修复 bug"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "shell",
+              "arguments": "{\"command\":[\"ls\"]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "content": "a.txt"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_2",
+            "type": "function",
+            "function": {
+              "name": "apply_patch",
+              "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_2",
+        "content": "Done!"
+      },
+      {
+        "role": "user",
+        "content": "继续"
+      }
+    ],
+    "max_tokens": 16384,
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "shell",
+          "description": "Run a command",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_patch",
+          "description": "Apply a patch",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "input": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "input"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true
+  },
+  "meta": {
+    "stream": true,
+    "client_model": "gpt-5-codex",
+    "upstream_model": "upstream-model",
+    "tool_names": [
+      "shell",
+      "apply_patch"
+    ],
+    "custom_tool_names": [
+      "apply_patch"
+    ],
+    "hosted_web_search": "web_search"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "status": 429,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "error": {
+      "message": "slow down",
+      "type": "rate_limit_error",
+      "code": null
+    }
+  }
+}

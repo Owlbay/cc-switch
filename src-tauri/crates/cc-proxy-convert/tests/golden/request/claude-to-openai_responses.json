@@ -1,0 +1,128 @@
+{
+  "method": "POST",
+  "path": "/v1/responses",
+  "query": null,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "user-agent",
+      "claude-cli/2.1.0 (external, cli)"
+    ],
+    [
+      "x-claude-code-session-id",
+      "session-1"
+    ]
+  ],
+  "body": {
+    "model": "upstream-model",
+    "instructions": "You are Claude Code.",
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "列出文件并看一下这张图"
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,aGVsbG8="
+          }
+        ]
+      },
+      {
+        "id": "rs_prev",
+        "type": "reasoning",
+        "encrypted_content": "gAAAAABoPrevEncrypted",
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "先列目录"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "toolu_1",
+        "name": "Bash",
+        "arguments": "{\"command\":\"ls\"}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "toolu_1",
+        "output": "a.txt\nb.png"
+      },
+      {
+        "type": "function_call",
+        "call_id": "toolu_2",
+        "name": "Bash",
+        "arguments": "{\"command\":\"cat a.txt\"}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "toolu_2",
+        "output": "hello"
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "继续"
+          }
+        ]
+      }
+    ],
+    "max_output_tokens": 8192,
+    "user": "user_abc_session_1",
+    "stream": true,
+    "store": false,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "max_tool_calls": 5,
+    "tools": [
+      {
+        "type": "function",
+        "name": "Bash",
+        "description": "Run a shell command",
+        "parameters": {
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        "strict": false
+      },
+      {
+        "type": "web_search"
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "meta": {
+    "stream": true,
+    "client_model": "claude-sonnet-5",
+    "upstream_model": "upstream-model",
+    "tool_names": [
+      "Bash"
+    ],
+    "custom_tool_names": [],
+    "hosted_web_search": "web_search"
+  }
+}

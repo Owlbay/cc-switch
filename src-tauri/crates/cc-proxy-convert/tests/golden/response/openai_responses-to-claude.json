@@ -1,0 +1,43 @@
+{
+  "status": 200,
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "body": {
+    "id": "msg_resp_68d9",
+    "type": "message",
+    "role": "assistant",
+    "model": "client-model",
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": "用户想看目录，先运行 ls。",
+        "signature": "ccsw1.openai_responses.decoded:{\"item\":{\"id\":\"rs_68d9a\",\"type\":\"reasoning\",\"encrypted_content\":\"gAAAAABo2MockEncryptedContentForFixture\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"用户想看目录，先运行 ls。\"}]}}"
+      },
+      {
+        "type": "text",
+        "text": "我先看一下当前目录。"
+      },
+      {
+        "type": "tool_use",
+        "id": "call_Kx1",
+        "name": "Bash",
+        "input": {
+          "command": "ls -la",
+          "description": "列出文件"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 3252,
+      "output_tokens": 87,
+      "cache_read_input_tokens": 18342,
+      "cache_creation_input_tokens": 0
+    }
+  }
+}

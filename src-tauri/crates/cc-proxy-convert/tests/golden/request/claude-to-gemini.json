@@ -1,0 +1,151 @@
+{
+  "method": "POST",
+  "path": "/v1beta/models/upstream-model:streamGenerateContent",
+  "query": "alt=sse",
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ],
+    [
+      "user-agent",
+      "claude-cli/2.1.0 (external, cli)"
+    ],
+    [
+      "x-claude-code-session-id",
+      "session-1"
+    ]
+  ],
+  "body": {
+    "systemInstruction": {
+      "parts": [
+        {
+          "text": "You are Claude Code."
+        }
+      ]
+    },
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "列出文件并看一下这张图"
+          },
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "aGVsbG8="
+            }
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "Bash",
+              "args": {
+                "command": "ls"
+              },
+              "id": "toolu_1"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "Bash",
+              "id": "toolu_1",
+              "response": {
+                "content": "a.txt\nb.png"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "Bash",
+              "args": {
+                "command": "cat a.txt"
+              },
+              "id": "toolu_2"
+            },
+            "thoughtSignature": "CiQBPrevThoughtSignature"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "Bash",
+              "id": "toolu_2",
+              "response": {
+                "content": "hello"
+              }
+            }
+          },
+          {
+            "text": "继续"
+          }
+        ]
+      }
+    ],
+    "tools": [
+      {
+        "functionDeclarations": [
+          {
+            "name": "Bash",
+            "description": "Run a shell command",
+            "parametersJsonSchema": {
+              "additionalProperties": false,
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        ]
+      }
+    ],
+    "toolConfig": {
+      "functionCallingConfig": {
+        "mode": "AUTO"
+      }
+    },
+    "generationConfig": {
+      "maxOutputTokens": 8192,
+      "thinkingConfig": {
+        "thinkingBudget": 4096,
+        "includeThoughts": true
+      }
+    }
+  },
+  "meta": {
+    "stream": true,
+    "client_model": "claude-sonnet-5",
+    "upstream_model": "upstream-model",
+    "tool_names": [
+      "Bash"
+    ],
+    "custom_tool_names": [],
+    "hosted_web_search": "web_search"
+  }
+}
