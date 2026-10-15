@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { settingsApi } from "@/lib/api";
 import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
 
@@ -39,15 +39,6 @@ export function useImportExport(
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [backupId, setBackupId] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
-  const successTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (successTimerRef.current) {
-        window.clearTimeout(successTimerRef.current);
-      }
-    };
-  }, []);
 
   const clearSelection = useCallback(() => {
     setSelectedFile("");
@@ -78,7 +69,7 @@ export function useImportExport(
     if (!selectedFile) {
       toast.error(
         t("settings.selectFileFailed", {
-          defaultValue: "请选择有效的配置文件",
+          defaultValue: "请选择有效的 SQL 备份文件",
         }),
       );
       return;
@@ -97,7 +88,7 @@ export function useImportExport(
         const message =
           result.message ||
           t("settings.configCorrupted", {
-            defaultValue: "配置文件已损坏或格式不正确",
+            defaultValue: "SQL 文件已损坏或格式不正确",
           });
         setErrorMessage(message);
         toast.error(message);
@@ -105,6 +96,10 @@ export function useImportExport(
       }
 
       setBackupId(result.backupId ?? null);
+      // 导入成功后立即触发外部刷新（与 live 同步结果解耦）
+      // - 避免 sync 失败时 UI 不刷新
+      // - 避免依赖 setTimeout（组件卸载会取消）
+      void onImportSuccess?.();
 
       const syncResult = await syncCurrentProvidersLiveSafe();
       if (syncResult.ok) {
@@ -113,11 +108,8 @@ export function useImportExport(
           t("settings.importSuccess", {
             defaultValue: "配置导入成功",
           }),
+          { closeButton: true },
         );
-
-        successTimerRef.current = window.setTimeout(() => {
-          void onImportSuccess?.();
-        }, 1500);
       } else {
         console.error(
           "[useImportExport] Failed to sync live config",
@@ -150,14 +142,14 @@ export function useImportExport(
 
   const exportConfig = useCallback(async () => {
     try {
-      const defaultName = `cc-switch-config-${
-        new Date().toISOString().split("T")[0]
-      }.json`;
+      const now = new Date();
+      const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
+      const defaultName = `cc-switch-export-${stamp}.sql`;
       const destination = await settingsApi.saveFileDialog(defaultName);
       if (!destination) {
         toast.error(
           t("settings.selectFileFailed", {
-            defaultValue: "选择保存位置失败",
+            defaultValue: "请选择 SQL 备份保存路径",
           }),
         );
         return;
@@ -170,6 +162,7 @@ export function useImportExport(
           t("settings.configExported", {
             defaultValue: "配置已导出",
           }) + `\n${displayPath}`,
+          { closeButton: true },
         );
       } else {
         toast.error(

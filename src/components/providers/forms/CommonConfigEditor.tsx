@@ -1,214 +1,265 @@
 import { useTranslation } from "react-i18next";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { Label } from "@/components/ui/label";
-import { Button } from "@/components/ui/button";
-import { Save, Wand2 } from "lucide-react";
-import { toast } from "sonner";
-import { formatJSON } from "@/utils/formatters";
+import { HelpTip } from "@/components/ui/help-tip";
+import JsonEditor from "@/components/JsonEditor";
+import type { ProviderEditorInactiveField } from "@/lib/api/providers";
+import { CLAUDE_AUTO_MODE_SERVER_ENV } from "@/utils/claudeEditorOverlay";
+import { InactiveFieldsPanel } from "./InactiveFieldsPanel";
+
+/** 编辑框上方的快捷开关，顺序即显示顺序；文案在 `claudeConfig.<key>` 和 `claudeConfig.<key>Help`。 */
+const QUICK_TOGGLES = [
+  "hideAttribution",
+  "enableToolSearch",
+  "disableAutoUpgrade",
+  "disableArtifact",
+  "disableAutoModeServer",
+] as const;
 
 interface CommonConfigEditorProps {
   value: string;
   onChange: (value: string) => void;
-  useCommonConfig: boolean;
-  onCommonConfigToggle: (checked: boolean) => void;
-  commonConfigSnippet: string;
-  onCommonConfigSnippetChange: (value: string) => void;
-  commonConfigError: string;
-  onEditClick: () => void;
-  isModalOpen: boolean;
-  onModalClose: () => void;
+  /** 行里保存着、但不随切换生效的字段；可以一键加进上方 JSON（保存后成为全局设置）。 */
+  inactiveFields?: ProviderEditorInactiveField[];
 }
+
+/** 把一个字段写进 JSON 文本；解析不了就原样返回。 */
+const setFieldInConfig = (
+  configText: string,
+  field: ProviderEditorInactiveField,
+): string | null => {
+  try {
+    const config = JSON.parse(configText || "{}") as Record<string, unknown>;
+    let target: Record<string, unknown> = config;
+    for (const segment of field.path.slice(0, -1)) {
+      const next = target[segment];
+      if (typeof next !== "object" || next === null || Array.isArray(next)) {
+        target[segment] = {};
+      }
+      target = target[segment] as Record<string, unknown>;
+    }
+    target[field.path[field.path.length - 1]] = field.value;
+    return JSON.stringify(config, null, 2);
+  } catch {
+    return null;
+  }
+};
 
 export function CommonConfigEditor({
   value,
   onChange,
-  useCommonConfig,
-  onCommonConfigToggle,
-  commonConfigSnippet,
-  onCommonConfigSnippetChange,
-  commonConfigError,
-  onEditClick,
-  isModalOpen,
-  onModalClose,
+  inactiveFields = [],
 }: CommonConfigEditorProps) {
   const { t } = useTranslation();
+  const [isDarkMode, setIsDarkMode] = useState(false);
 
-  const handleFormatMain = () => {
-    if (!value.trim()) return;
+  useEffect(() => {
+    setIsDarkMode(document.documentElement.classList.contains("dark"));
 
+    const observer = new MutationObserver(() => {
+      setIsDarkMode(document.documentElement.classList.contains("dark"));
+    });
+
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+
+    return () => observer.disconnect();
+  }, []);
+
+  // Mirror value prop to local state so checkbox toggles and JsonEditor stay in sync
+  // (parent uses form.getValues which doesn't trigger re-renders)
+  const [localValue, setLocalValue] = useState(value);
+
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+
+  const handleLocalChange = useCallback(
+    (newValue: string) => {
+      setLocalValue(newValue);
+      onChange(newValue);
+    },
+    [onChange],
+  );
+
+  const toggleStates = useMemo(() => {
     try {
-      const formatted = formatJSON(value);
-      onChange(formatted);
-      toast.success(t("common.formatSuccess", { defaultValue: "格式化成功" }));
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      toast.error(
-        t("common.formatError", {
-          defaultValue: "格式化失败：{{error}}",
-          error: errorMessage,
-        }),
-      );
+      const config = JSON.parse(localValue);
+      return {
+        hideAttribution:
+          config?.attribution?.commit === "" &&
+          config?.attribution?.pr === "" &&
+          config?.attribution?.sessionUrl === false,
+        enableToolSearch:
+          config?.env?.ENABLE_TOOL_SEARCH === "true" ||
+          config?.env?.ENABLE_TOOL_SEARCH === "1",
+        disableAutoUpgrade:
+          config?.env?.DISABLE_AUTOUPDATER === "1" ||
+          config?.env?.DISABLE_AUTOUPDATER === 1,
+        disableArtifact:
+          config?.env?.CLAUDE_CODE_DISABLE_ARTIFACT === "1" ||
+          config?.env?.CLAUDE_CODE_DISABLE_ARTIFACT === 1,
+        disableAutoModeServer:
+          config?.env?.[CLAUDE_AUTO_MODE_SERVER_ENV] === "0" ||
+          config?.env?.[CLAUDE_AUTO_MODE_SERVER_ENV] === 0,
+      };
+    } catch {
+      return {
+        hideAttribution: false,
+        enableToolSearch: false,
+        disableAutoUpgrade: false,
+        disableArtifact: false,
+        disableAutoModeServer: false,
+      };
     }
-  };
+  }, [localValue]);
 
-  const handleFormatModal = () => {
-    if (!commonConfigSnippet.trim()) return;
+  const handleToggle = useCallback(
+    (toggleKey: (typeof QUICK_TOGGLES)[number], checked: boolean) => {
+      try {
+        const config = JSON.parse(localValue || "{}");
 
+        switch (toggleKey) {
+          case "hideAttribution":
+            if (checked) {
+              config.attribution = { commit: "", pr: "", sessionUrl: false };
+            } else {
+              delete config.attribution;
+            }
+            break;
+          case "enableToolSearch":
+            if (!config.env) config.env = {};
+            if (checked) {
+              config.env.ENABLE_TOOL_SEARCH = "true";
+            } else {
+              delete config.env.ENABLE_TOOL_SEARCH;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+          case "disableAutoUpgrade":
+            if (!config.env) config.env = {};
+            if (checked) {
+              config.env.DISABLE_AUTOUPDATER = "1";
+            } else {
+              delete config.env.DISABLE_AUTOUPDATER;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+          case "disableArtifact":
+            // 第三方网关（如 DeepSeek）用严格 JSON Schema 校验工具定义，
+            // Artifact 工具灰度中的 \p{..} 正则会让每个请求 400；
+            // 该变量让 Claude Code 压根不把 Artifact 放进 tools 数组。
+            if (!config.env) config.env = {};
+            if (checked) {
+              config.env.CLAUDE_CODE_DISABLE_ARTIFACT = "1";
+            } else {
+              delete config.env.CLAUDE_CODE_DISABLE_ARTIFACT;
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+          case "disableAutoModeServer":
+            if (!config.env) config.env = {};
+            if (checked) {
+              config.env[CLAUDE_AUTO_MODE_SERVER_ENV] = "0";
+            } else {
+              delete config.env[CLAUDE_AUTO_MODE_SERVER_ENV];
+              if (Object.keys(config.env).length === 0) delete config.env;
+            }
+            break;
+        }
+
+        handleLocalChange(JSON.stringify(config, null, 2));
+      } catch {
+        // Don't modify if JSON is invalid
+      }
+    },
+    [localValue, handleLocalChange],
+  );
+
+  const handleAddInactiveField = useCallback(
+    (field: ProviderEditorInactiveField) => {
+      const next = setFieldInConfig(localValue, field);
+      if (next !== null) {
+        handleLocalChange(next);
+      }
+    },
+    [localValue, handleLocalChange],
+  );
+
+  const pendingInactiveFields = useMemo(() => {
     try {
-      const formatted = formatJSON(commonConfigSnippet);
-      onCommonConfigSnippetChange(formatted);
-      toast.success(t("common.formatSuccess", { defaultValue: "格式化成功" }));
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      toast.error(
-        t("common.formatError", {
-          defaultValue: "格式化失败：{{error}}",
-          error: errorMessage,
-        }),
-      );
+      const config = JSON.parse(localValue || "{}") as Record<string, unknown>;
+      return inactiveFields.filter((field) => {
+        let current: unknown = config;
+        for (const segment of field.path) {
+          if (typeof current !== "object" || current === null) return true;
+          current = (current as Record<string, unknown>)[segment];
+        }
+        return JSON.stringify(current) !== JSON.stringify(field.value);
+      });
+    } catch {
+      return inactiveFields;
     }
-  };
+  }, [inactiveFields, localValue]);
 
   return (
-    <>
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <Label htmlFor="settingsConfig">{t("provider.configJson")}</Label>
-          <div className="flex items-center gap-2">
-            <label className="inline-flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
+    <div className="space-y-2">
+      <Label htmlFor="settingsConfig">{t("provider.configJson")}</Label>
+      <p className="text-xs text-fg-2">
+        {t("claudeConfig.keyFieldsHint", {
+          defaultValue:
+            "地址、Key、模型、上下文窗口和兼容开关随供应商切换；其余字段是 Claude Code 全局设置，保存后对所有供应商生效。",
+        })}
+      </p>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        {QUICK_TOGGLES.map((key) => (
+          <span key={key} className="inline-flex items-center gap-1">
+            <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
               <input
                 type="checkbox"
-                id="useCommonConfig"
-                checked={useCommonConfig}
-                onChange={(e) => onCommonConfigToggle(e.target.checked)}
-                className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+                checked={toggleStates[key]}
+                onChange={(e) => handleToggle(key, e.target.checked)}
+                className="ui-checkbox"
               />
-              <span>
-                {t("claudeConfig.writeCommonConfig", {
-                  defaultValue: "写入通用配置",
-                })}
-              </span>
+              <span>{t(`claudeConfig.${key}`)}</span>
             </label>
-          </div>
-        </div>
-        <div className="flex items-center justify-end">
-          <button
-            type="button"
-            onClick={onEditClick}
-            className="text-xs text-blue-400 dark:text-blue-500 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
-          >
-            {t("claudeConfig.editCommonConfig", {
-              defaultValue: "编辑通用配置",
-            })}
-          </button>
-        </div>
-        {commonConfigError && !isModalOpen && (
-          <p className="text-xs text-red-500 dark:text-red-400 text-right">
-            {commonConfigError}
-          </p>
-        )}
-        <textarea
-          id="settingsConfig"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={`{
+            <HelpTip title={t(`claudeConfig.${key}`)}>
+              {t(`claudeConfig.${key}Help`)}
+            </HelpTip>
+          </span>
+        ))}
+      </div>
+      <JsonEditor
+        value={localValue}
+        onChange={handleLocalChange}
+        ariaLabel={t("provider.configJson")}
+        placeholder={`{
   "env": {
     "ANTHROPIC_BASE_URL": "https://your-api-endpoint.com",
     "ANTHROPIC_AUTH_TOKEN": "your-api-key-here"
   }
 }`}
-          rows={14}
-          className="w-full px-3 py-2 border border-border-default dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20 transition-colors resize-y min-h-[16rem]"
-          autoComplete="off"
-          autoCorrect="off"
-          autoCapitalize="none"
-          spellCheck={false}
-          lang="en"
-          inputMode="text"
-          data-gramm="false"
-          data-gramm_editor="false"
-          data-enable-grammarly="false"
-        />
-        <div className="flex items-center justify-between">
-          <button
-            type="button"
-            onClick={handleFormatMain}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
-          >
-            <Wand2 className="w-3.5 h-3.5" />
-            {t("common.format", { defaultValue: "格式化" })}
-          </button>
-        </div>
-      </div>
-
-      <Dialog
-        open={isModalOpen}
-        onOpenChange={(open) => !open && onModalClose()}
-      >
-        <DialogContent className="sm:max-w-[600px] max-h-[90vh] flex flex-col p-0">
-          <DialogHeader className="px-6 pt-6 pb-0">
-            <DialogTitle>
-              {t("claudeConfig.editCommonConfigTitle", {
-                defaultValue: "编辑通用配置片段",
-              })}
-            </DialogTitle>
-          </DialogHeader>
-          <div className="flex-1 overflow-auto px-6 py-4 space-y-4">
-            <p className="text-sm text-muted-foreground">
-              {t("claudeConfig.commonConfigHint", {
-                defaultValue: "通用配置片段将合并到所有启用它的供应商配置中",
-              })}
-            </p>
-            <textarea
-              value={commonConfigSnippet}
-              onChange={(e) => onCommonConfigSnippetChange(e.target.value)}
-              rows={12}
-              className="w-full px-3 py-2 border border-border-default dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20 transition-colors resize-y min-h-[14rem]"
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="none"
-              spellCheck={false}
-              lang="en"
-              inputMode="text"
-              data-gramm="false"
-              data-gramm_editor="false"
-              data-enable-grammarly="false"
-            />
-            <div className="flex items-center justify-between">
-              <button
-                type="button"
-                onClick={handleFormatModal}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
-              >
-                <Wand2 className="w-3.5 h-3.5" />
-                {t("common.format", { defaultValue: "格式化" })}
-              </button>
-              {commonConfigError && (
-                <p className="text-sm text-red-500 dark:text-red-400">
-                  {commonConfigError}
-                </p>
-              )}
-            </div>
-          </div>
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={onModalClose}>
-              {t("common.cancel")}
-            </Button>
-            <Button type="button" onClick={onModalClose} className="gap-2">
-              <Save className="w-4 h-4" />
-              {t("common.save")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
+        darkMode={isDarkMode}
+        rows={3}
+        showValidation={true}
+        language="json"
+      />
+      <InactiveFieldsPanel
+        fields={pendingInactiveFields}
+        hint={t("claudeConfig.inactiveFieldsHint", {
+          defaultValue:
+            "这些是旧版存进卡里的设置，现在切换不会写出去。点一下加入上方，保存后对所有供应商生效。",
+        })}
+        action={{
+          kind: "add",
+          title: t("claudeConfig.addToGlobalSettings", {
+            defaultValue: "加入全局设置",
+          }),
+          onAdd: handleAddInactiveField,
+        }}
+      />
+    </div>
   );
 }

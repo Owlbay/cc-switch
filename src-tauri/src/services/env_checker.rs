@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "windows"))]
 use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,32 +31,52 @@ pub fn check_env_conflicts(app: &str) -> Result<Vec<EnvConflict>, String> {
     Ok(conflicts)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvKeyword {
+    Exact(&'static str),
+    Prefix(&'static str),
+}
+
 /// Get relevant keywords for each app
-fn get_keywords_for_app(app: &str) -> Vec<&str> {
+fn get_keywords_for_app(app: &str) -> Vec<EnvKeyword> {
     match app.to_lowercase().as_str() {
-        "claude" => vec!["ANTHROPIC"],
-        "codex" => vec!["OPENAI"],
+        "claude" => vec![EnvKeyword::Prefix("ANTHROPIC")],
+        "codex" => vec![EnvKeyword::Prefix("OPENAI")],
+        "gemini" => vec![
+            EnvKeyword::Prefix("GEMINI"),
+            EnvKeyword::Prefix("GOOGLE_GEMINI"),
+        ],
+        "grokbuild" | "grok" => vec![
+            EnvKeyword::Exact("XAI_API_KEY"),
+            EnvKeyword::Exact("GROK_DEFAULT_MODEL"),
+        ],
         _ => vec![],
     }
 }
 
+fn matches_env_keyword(name: &str, keywords: &[EnvKeyword]) -> bool {
+    let upper_name = name.to_uppercase();
+    keywords.iter().any(|keyword| match keyword {
+        EnvKeyword::Exact(name) => upper_name == *name,
+        EnvKeyword::Prefix(prefix) => upper_name.starts_with(prefix),
+    })
+}
+
 /// Check system environment variables (Windows Registry or Unix env)
 #[cfg(target_os = "windows")]
-fn check_system_env(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
+fn check_system_env(keywords: &[EnvKeyword]) -> Result<Vec<EnvConflict>, String> {
     let mut conflicts = Vec::new();
 
     // Check HKEY_CURRENT_USER\Environment
     if let Ok(hkcu) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
         for (name, value) in hkcu.enum_values().filter_map(Result::ok) {
-            if keywords.iter().any(|k| name.to_uppercase().contains(k)) {
-                if let Ok(val) = value.to_string() {
-                    conflicts.push(EnvConflict {
-                        var_name: name.clone(),
-                        var_value: val,
-                        source_type: "system".to_string(),
-                        source_path: "HKEY_CURRENT_USER\\Environment".to_string(),
-                    });
-                }
+            if matches_env_keyword(&name, keywords) {
+                conflicts.push(EnvConflict {
+                    var_name: name.clone(),
+                    var_value: value.to_string(),
+                    source_type: "system".to_string(),
+                    source_path: "HKEY_CURRENT_USER\\Environment".to_string(),
+                });
             }
         }
     }
@@ -65,15 +86,13 @@ fn check_system_env(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
         .open_subkey("SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment")
     {
         for (name, value) in hklm.enum_values().filter_map(Result::ok) {
-            if keywords.iter().any(|k| name.to_uppercase().contains(k)) {
-                if let Ok(val) = value.to_string() {
-                    conflicts.push(EnvConflict {
-                        var_name: name.clone(),
-                        var_value: val,
-                        source_type: "system".to_string(),
-                        source_path: "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment".to_string(),
-                    });
-                }
+            if matches_env_keyword(&name, keywords) {
+                conflicts.push(EnvConflict {
+                    var_name: name.clone(),
+                    var_value: value.to_string(),
+                    source_type: "system".to_string(),
+                    source_path: "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment".to_string(),
+                });
             }
         }
     }
@@ -82,12 +101,12 @@ fn check_system_env(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn check_system_env(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
+fn check_system_env(keywords: &[EnvKeyword]) -> Result<Vec<EnvConflict>, String> {
     let mut conflicts = Vec::new();
 
     // Check current process environment
     for (key, value) in std::env::vars() {
-        if keywords.iter().any(|k| key.to_uppercase().contains(k)) {
+        if matches_env_keyword(&key, keywords) {
             conflicts.push(EnvConflict {
                 var_name: key,
                 var_value: value,
@@ -102,7 +121,7 @@ fn check_system_env(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
 
 /// Check shell configuration files for environment variable exports (Unix only)
 #[cfg(not(target_os = "windows"))]
-fn check_shell_configs(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
+fn check_shell_configs(keywords: &[EnvKeyword]) -> Result<Vec<EnvConflict>, String> {
     let mut conflicts = Vec::new();
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -133,7 +152,7 @@ fn check_shell_configs(keywords: &[&str]) -> Result<Vec<EnvConflict>, String> {
                         let var_value = export_line[eq_pos + 1..].trim();
 
                         // Check if variable name contains any keyword
-                        if keywords.iter().any(|k| var_name.to_uppercase().contains(k)) {
+                        if matches_env_keyword(var_name, keywords) {
                             conflicts.push(EnvConflict {
                                 var_name: var_name.to_string(),
                                 var_value: var_value
@@ -159,8 +178,58 @@ mod tests {
 
     #[test]
     fn test_get_keywords() {
-        assert_eq!(get_keywords_for_app("claude"), vec!["ANTHROPIC"]);
-        assert_eq!(get_keywords_for_app("codex"), vec!["OPENAI"]);
-        assert_eq!(get_keywords_for_app("unknown"), Vec::<&str>::new());
+        assert_eq!(
+            get_keywords_for_app("claude"),
+            vec![EnvKeyword::Prefix("ANTHROPIC")]
+        );
+        assert_eq!(
+            get_keywords_for_app("codex"),
+            vec![EnvKeyword::Prefix("OPENAI")]
+        );
+        assert_eq!(
+            get_keywords_for_app("gemini"),
+            vec![
+                EnvKeyword::Prefix("GEMINI"),
+                EnvKeyword::Prefix("GOOGLE_GEMINI")
+            ]
+        );
+        assert_eq!(
+            get_keywords_for_app("grokbuild"),
+            vec![
+                EnvKeyword::Exact("XAI_API_KEY"),
+                EnvKeyword::Exact("GROK_DEFAULT_MODEL")
+            ]
+        );
+        assert_eq!(
+            get_keywords_for_app("grok"),
+            get_keywords_for_app("grokbuild")
+        );
+        assert_eq!(get_keywords_for_app("unknown"), Vec::<EnvKeyword>::new());
+    }
+
+    #[test]
+    fn grok_keywords_only_match_credentials() {
+        let keywords = get_keywords_for_app("grokbuild");
+
+        assert!(matches_env_keyword("XAI_API_KEY", &keywords));
+        assert!(matches_env_keyword("xai_api_key", &keywords));
+        assert!(matches_env_keyword("GROK_DEFAULT_MODEL", &keywords));
+        assert!(matches_env_keyword("grok_default_model", &keywords));
+        assert!(!matches_env_keyword("MY_XAI_API_KEY", &keywords));
+        assert!(!matches_env_keyword("XAI_API_KEY_BACKUP", &keywords));
+        assert!(!matches_env_keyword("MY_GROK_DEFAULT_MODEL", &keywords));
+        assert!(!matches_env_keyword("GROK_DEFAULT_MODEL_BACKUP", &keywords));
+        assert!(!matches_env_keyword("GROK_BIN_DIR", &keywords));
+        assert!(!matches_env_keyword("GROK_HOME", &keywords));
+    }
+
+    #[test]
+    fn broad_app_keywords_match_only_at_the_start() {
+        let keywords = get_keywords_for_app("claude");
+
+        assert!(matches_env_keyword("ANTHROPIC_API_KEY", &keywords));
+        assert!(matches_env_keyword("anthropic_base_url", &keywords));
+        assert!(!matches_env_keyword("MY_ANTHROPIC_API_KEY", &keywords));
+        assert!(!matches_env_keyword("NOT_ANTHROPIC", &keywords));
     }
 }

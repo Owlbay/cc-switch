@@ -2,9 +2,12 @@ import { useMemo } from "react";
 import { FolderSearch, Undo2 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { HoverTip } from "@/components/ui/hover-tip";
 import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import type { ResolvedDirectories } from "@/hooks/useSettings";
+
+export type DirectoryAppId = Exclude<AppId, "claude-desktop" | "mcode">;
 
 interface DirectorySettingsProps {
   appConfigDir?: string;
@@ -14,9 +17,15 @@ interface DirectorySettingsProps {
   onResetAppConfig: () => Promise<void>;
   claudeDir?: string;
   codexDir?: string;
-  onDirectoryChange: (app: AppId, value?: string) => void;
-  onBrowseDirectory: (app: AppId) => Promise<void>;
-  onResetDirectory: (app: AppId) => Promise<void>;
+  geminiDir?: string;
+  grokDir?: string;
+  opencodeDir?: string;
+  openclawDir?: string;
+  hermesDir?: string;
+  piDir?: string;
+  onDirectoryChange: (app: DirectoryAppId, value?: string) => void;
+  onBrowseDirectory: (app: DirectoryAppId) => Promise<void>;
+  onResetDirectory: (app: DirectoryAppId) => Promise<void>;
 }
 
 export function DirectorySettings({
@@ -27,6 +36,12 @@ export function DirectorySettings({
   onResetAppConfig,
   claudeDir,
   codexDir,
+  geminiDir,
+  grokDir,
+  opencodeDir,
+  openclawDir,
+  hermesDir,
+  piDir,
   onDirectoryChange,
   onBrowseDirectory,
   onResetDirectory,
@@ -34,12 +49,12 @@ export function DirectorySettings({
   const { t } = useTranslation();
 
   return (
-    <>
+    <div className="space-y-6">
       {/* CC Switch 配置目录 - 独立区块 */}
       <section className="space-y-4">
         <header className="space-y-1">
           <h3 className="text-sm font-medium">{t("settings.appConfigDir")}</h3>
-          <p className="text-xs text-muted-foreground">
+          <p className="text-xs text-fg-2">
             {t("settings.appConfigDirDescription")}
           </p>
         </header>
@@ -48,27 +63,31 @@ export function DirectorySettings({
           <Input
             value={appConfigDir ?? resolvedDirs.appConfig ?? ""}
             placeholder={t("settings.browsePlaceholderApp")}
-            className="font-mono text-xs"
+            className="text-xs"
             onChange={(event) => onAppConfigChange(event.target.value)}
           />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={onBrowseAppConfig}
-            title={t("settings.browseDirectory")}
-          >
-            <FolderSearch className="h-4 w-4" />
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={onResetAppConfig}
-            title={t("settings.resetDefault")}
-          >
-            <Undo2 className="h-4 w-4" />
-          </Button>
+          <HoverTip content={t("settings.browseDirectory")}>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={onBrowseAppConfig}
+              aria-label={t("settings.browseDirectory")}
+            >
+              <FolderSearch className="h-4 w-4" />
+            </Button>
+          </HoverTip>
+          <HoverTip content={t("settings.resetDefault")}>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={onResetAppConfig}
+              aria-label={t("settings.resetDefault")}
+            >
+              <Undo2 className="h-4 w-4" />
+            </Button>
+          </HoverTip>
         </div>
       </section>
 
@@ -78,7 +97,7 @@ export function DirectorySettings({
           <h3 className="text-sm font-medium">
             {t("settings.configDirectoryOverride")}
           </h3>
-          <p className="text-xs text-muted-foreground">
+          <p className="text-xs text-fg-2">
             {t("settings.configDirectoryDescription")}
           </p>
         </header>
@@ -104,12 +123,78 @@ export function DirectorySettings({
           onBrowse={() => onBrowseDirectory("codex")}
           onReset={() => onResetDirectory("codex")}
         />
+
+        <DirectoryInput
+          label={t("settings.geminiConfigDir")}
+          description={undefined}
+          value={geminiDir}
+          resolvedValue={resolvedDirs.gemini}
+          placeholder={t("settings.browsePlaceholderGemini")}
+          onChange={(val) => onDirectoryChange("gemini", val)}
+          onBrowse={() => onBrowseDirectory("gemini")}
+          onReset={() => onResetDirectory("gemini")}
+        />
+
+        <DirectoryInput
+          label={t("settings.grokConfigDir")}
+          description={undefined}
+          value={grokDir}
+          resolvedValue={resolvedDirs.grokbuild}
+          placeholder={t("settings.browsePlaceholderGrok")}
+          onChange={(val) => onDirectoryChange("grokbuild", val)}
+          onBrowse={() => onBrowseDirectory("grokbuild")}
+          onReset={() => onResetDirectory("grokbuild")}
+        />
+
+        <DirectoryInput
+          label={t("settings.opencodeConfigDir")}
+          description={undefined}
+          value={opencodeDir}
+          resolvedValue={resolvedDirs.opencode}
+          placeholder={t("settings.browsePlaceholderOpencode")}
+          onChange={(val) => onDirectoryChange("opencode", val)}
+          onBrowse={() => onBrowseDirectory("opencode")}
+          onReset={() => onResetDirectory("opencode")}
+        />
+
+        <DirectoryInput
+          label={t("settings.openclawConfigDir")}
+          description={undefined}
+          value={openclawDir}
+          resolvedValue={resolvedDirs.openclaw}
+          placeholder={t("settings.browsePlaceholderOpenclaw")}
+          onChange={(val) => onDirectoryChange("openclaw", val)}
+          onBrowse={() => onBrowseDirectory("openclaw")}
+          onReset={() => onResetDirectory("openclaw")}
+        />
+
+        <DirectoryInput
+          label={t("settings.hermesConfigDir")}
+          description={undefined}
+          value={hermesDir}
+          resolvedValue={resolvedDirs.hermes}
+          placeholder={t("settings.browsePlaceholderHermes")}
+          onChange={(val) => onDirectoryChange("hermes", val)}
+          onBrowse={() => onBrowseDirectory("hermes")}
+          onReset={() => onResetDirectory("hermes")}
+        />
+
+        <DirectoryInput
+          label={t("settings.piConfigDir")}
+          description={undefined}
+          value={piDir}
+          resolvedValue={resolvedDirs.pi}
+          placeholder={t("settings.browsePlaceholderPi")}
+          onChange={(val) => onDirectoryChange("pi", val)}
+          onBrowse={() => onBrowseDirectory("pi")}
+          onReset={() => onResetDirectory("pi")}
+        />
       </section>
-    </>
+    </div>
   );
 }
 
-interface DirectoryInputProps {
+export interface DirectoryInputProps {
   label: string;
   description?: string;
   value?: string;
@@ -120,7 +205,7 @@ interface DirectoryInputProps {
   onReset: () => Promise<void>;
 }
 
-function DirectoryInput({
+export function DirectoryInput({
   label,
   description,
   value,
@@ -138,37 +223,45 @@ function DirectoryInput({
 
   return (
     <div className="space-y-1.5">
-      <div className="space-y-1">
-        <p className="text-xs font-medium text-foreground">{label}</p>
-        {description ? (
-          <p className="text-xs text-muted-foreground">{description}</p>
-        ) : null}
-      </div>
+      {label || description ? (
+        <div className="space-y-1">
+          {label ? (
+            <p className="text-xs font-medium text-fg-1">{label}</p>
+          ) : null}
+          {description ? (
+            <p className="text-xs text-fg-2">{description}</p>
+          ) : null}
+        </div>
+      ) : null}
       <div className="flex items-center gap-2">
         <Input
           value={displayValue}
           placeholder={placeholder}
-          className="font-mono text-xs"
+          className="text-xs"
           onChange={(event) => onChange(event.target.value)}
         />
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          onClick={onBrowse}
-          title={t("settings.browseDirectory")}
-        >
-          <FolderSearch className="h-4 w-4" />
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          onClick={onReset}
-          title={t("settings.resetDefault")}
-        >
-          <Undo2 className="h-4 w-4" />
-        </Button>
+        <HoverTip content={t("settings.browseDirectory")}>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={onBrowse}
+            aria-label={t("settings.browseDirectory")}
+          >
+            <FolderSearch className="h-4 w-4" />
+          </Button>
+        </HoverTip>
+        <HoverTip content={t("settings.resetDefault")}>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            onClick={onReset}
+            aria-label={t("settings.resetDefault")}
+          >
+            <Undo2 className="h-4 w-4" />
+          </Button>
+        </HoverTip>
       </div>
     </div>
   );

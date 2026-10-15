@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import type { ProviderCategory } from "@/types";
 import {
   getApiKeyFromConfig,
@@ -12,6 +12,7 @@ interface UseApiKeyStateProps {
   selectedPresetId: string | null;
   category?: ProviderCategory;
   appType?: string;
+  apiKeyField?: string;
 }
 
 /**
@@ -24,6 +25,7 @@ export function useApiKeyState({
   selectedPresetId,
   category,
   appType,
+  apiKeyField,
 }: UseApiKeyStateProps) {
   const [apiKey, setApiKey] = useState(() => {
     if (initialConfig) {
@@ -31,6 +33,24 @@ export function useApiKeyState({
     }
     return "";
   });
+
+  // 当外部通过 form.reset / 读取 live 等方式更新配置时，同步回 API Key 状态
+  // - 仅在 JSON 可解析时同步，避免用户编辑 JSON 过程中因临时无效导致输入框闪烁
+  useEffect(() => {
+    if (!initialConfig) return;
+
+    try {
+      JSON.parse(initialConfig);
+    } catch {
+      return;
+    }
+
+    // 从配置中提取 API Key（如果不存在则返回空字符串）
+    const extracted = getApiKeyFromConfig(initialConfig, appType);
+    if (extracted !== apiKey) {
+      setApiKey(extracted);
+    }
+  }, [initialConfig, appType, apiKey]);
 
   const handleApiKeyChange = useCallback(
     (key: string) => {
@@ -40,32 +60,40 @@ export function useApiKeyState({
         initialConfig || "{}",
         key.trim(),
         {
-          // 最佳实践：仅在“新增模式”且“非官方类别”时补齐缺失字段
-          // - 新增模式：selectedPresetId !== null
-          // - 非官方类别：category !== undefined && category !== "official"
+          // 最佳实践：仅在"非官方/非云厂商类别"时补齐缺失字段
           // - 官方类别：不创建字段（UI 也会禁用输入框）
-          // - 未传入 category：不创建字段（避免意外行为）
+          // - 云厂商类别：通常使用专用鉴权字段，不自动创建 Anthropic key
+          // - 未传入 category：按历史导入/自定义 provider 处理，允许补齐
           createIfMissing:
-            selectedPresetId !== null &&
-            category !== undefined &&
-            category !== "official",
+            category !== "official" && category !== "cloud_provider",
           appType,
+          apiKeyField,
         },
       );
 
       onConfigChange(configString);
     },
-    [initialConfig, selectedPresetId, category, appType, onConfigChange],
+    [
+      initialConfig,
+      selectedPresetId,
+      category,
+      appType,
+      apiKeyField,
+      onConfigChange,
+    ],
   );
 
   const showApiKey = useCallback(
     (config: string, isEditMode: boolean) => {
       return (
         selectedPresetId !== null ||
+        (isEditMode &&
+          category !== "official" &&
+          category !== "cloud_provider") ||
         (isEditMode && hasApiKeyField(config, appType))
       );
     },
-    [selectedPresetId, appType],
+    [selectedPresetId, category, appType],
   );
 
   return {

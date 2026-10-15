@@ -17,22 +17,37 @@ export function useGeminiConfigState({
   const [geminiConfig, setGeminiConfigState] = useState("");
   const [geminiApiKey, setGeminiApiKey] = useState("");
   const [geminiBaseUrl, setGeminiBaseUrl] = useState("");
+  const [geminiModel, setGeminiModel] = useState("");
   const [envError, setEnvError] = useState("");
   const [configError, setConfigError] = useState("");
 
   // 将 JSON env 对象转换为 .env 格式字符串
+  // 保留所有环境变量，已知 key 优先显示
   const envObjToString = useCallback(
     (envObj: Record<string, unknown>): string => {
+      const priorityKeys = [
+        "GOOGLE_GEMINI_BASE_URL",
+        "GEMINI_API_KEY",
+        "GEMINI_MODEL",
+      ];
       const lines: string[] = [];
-      if (typeof envObj.GOOGLE_GEMINI_BASE_URL === "string") {
-        lines.push(`GOOGLE_GEMINI_BASE_URL=${envObj.GOOGLE_GEMINI_BASE_URL}`);
+      const addedKeys = new Set<string>();
+
+      // 先添加已知 key（按顺序）
+      for (const key of priorityKeys) {
+        if (typeof envObj[key] === "string" && envObj[key]) {
+          lines.push(`${key}=${envObj[key]}`);
+          addedKeys.add(key);
+        }
       }
-      if (typeof envObj.GEMINI_API_KEY === "string") {
-        lines.push(`GEMINI_API_KEY=${envObj.GEMINI_API_KEY}`);
+
+      // 再添加其他自定义 key（保留用户添加的环境变量）
+      for (const [key, value] of Object.entries(envObj)) {
+        if (!addedKeys.has(key) && typeof value === "string") {
+          lines.push(`${key}=${value}`);
+        }
       }
-      if (typeof envObj.GEMINI_MODEL === "string") {
-        lines.push(`GEMINI_MODEL=${envObj.GEMINI_MODEL}`);
-      }
+
       return lines.join("\n");
     },
     [],
@@ -72,21 +87,25 @@ export function useGeminiConfigState({
       const configObj = (config as any).config || {};
       setGeminiConfigState(JSON.stringify(configObj, null, 2));
 
-      // 提取 API Key 和 Base URL
+      // 提取 API Key、Base URL 和 Model
       if (typeof env.GEMINI_API_KEY === "string") {
         setGeminiApiKey(env.GEMINI_API_KEY);
       }
       if (typeof env.GOOGLE_GEMINI_BASE_URL === "string") {
         setGeminiBaseUrl(env.GOOGLE_GEMINI_BASE_URL);
       }
+      if (typeof env.GEMINI_MODEL === "string") {
+        setGeminiModel(env.GEMINI_MODEL);
+      }
     }
   }, [initialData, envObjToString]);
 
-  // 从 geminiEnv 中提取并同步 API Key 和 Base URL
+  // 从 geminiEnv 中提取并同步 API Key、Base URL 和 Model
   useEffect(() => {
     const envObj = envStringToObj(geminiEnv);
     const extractedKey = envObj.GEMINI_API_KEY || "";
     const extractedBaseUrl = envObj.GOOGLE_GEMINI_BASE_URL || "";
+    const extractedModel = envObj.GEMINI_MODEL || "";
 
     if (extractedKey !== geminiApiKey) {
       setGeminiApiKey(extractedKey);
@@ -94,7 +113,10 @@ export function useGeminiConfigState({
     if (extractedBaseUrl !== geminiBaseUrl) {
       setGeminiBaseUrl(extractedBaseUrl);
     }
-  }, [geminiEnv, envStringToObj]);
+    if (extractedModel !== geminiModel) {
+      setGeminiModel(extractedModel);
+    }
+  }, [geminiEnv, envStringToObj, geminiApiKey, geminiBaseUrl, geminiModel]);
 
   // 验证 Gemini Config JSON
   const validateGeminiConfig = useCallback((value: string): string => {
@@ -156,6 +178,20 @@ export function useGeminiConfigState({
     [geminiEnv, envStringToObj, envObjToString, setGeminiEnv],
   );
 
+  // 处理 Gemini Model 变化
+  const handleGeminiModelChange = useCallback(
+    (model: string) => {
+      const trimmed = model.trim();
+      setGeminiModel(trimmed);
+
+      const envObj = envStringToObj(geminiEnv);
+      envObj.GEMINI_MODEL = trimmed;
+      const newEnv = envObjToString(envObj);
+      setGeminiEnv(newEnv);
+    },
+    [geminiEnv, envStringToObj, envObjToString, setGeminiEnv],
+  );
+
   // 处理 env 变化
   const handleGeminiEnvChange = useCallback(
     (value: string) => {
@@ -181,7 +217,7 @@ export function useGeminiConfigState({
       setGeminiEnv(envString);
       setGeminiConfig(configString);
 
-      // 提取 API Key 和 Base URL
+      // 提取 API Key、Base URL 和 Model
       if (typeof env.GEMINI_API_KEY === "string") {
         setGeminiApiKey(env.GEMINI_API_KEY);
       } else {
@@ -193,6 +229,12 @@ export function useGeminiConfigState({
       } else {
         setGeminiBaseUrl("");
       }
+
+      if (typeof env.GEMINI_MODEL === "string") {
+        setGeminiModel(env.GEMINI_MODEL);
+      } else {
+        setGeminiModel("");
+      }
     },
     [envObjToString, setGeminiEnv, setGeminiConfig],
   );
@@ -202,12 +244,14 @@ export function useGeminiConfigState({
     geminiConfig,
     geminiApiKey,
     geminiBaseUrl,
+    geminiModel,
     envError,
     configError,
     setGeminiEnv,
     setGeminiConfig,
     handleGeminiApiKeyChange,
     handleGeminiBaseUrlChange,
+    handleGeminiModelChange,
     handleGeminiEnvChange,
     handleGeminiConfigChange,
     resetGeminiConfig,

@@ -38,6 +38,13 @@
         <!-- Property to forward cli args to the launched app to not lose those of the pre-update instance -->
         <Property Id="LAUNCHAPPARGS" Secure="yes" />
 
+        <!-- Whether the desktop shortcut is still there before this install runs (AppSearch runs before the old version is removed) -->
+        <Property Id="DESKTOPSHORTCUTEXISTS">
+            <DirectorySearch Id="DesktopShortcutDirSearch" Path="[DesktopFolder]" Depth="0">
+                <FileSearch Id="DesktopShortcutFileSearch" Name="{{product_name}}.lnk" />
+            </DirectorySearch>
+        </Property>
+
         {{#if allow_downgrades}}
             <MajorUpgrade Schedule="afterInstallInitialize" AllowDowngrades="yes" />
         {{else}}
@@ -110,7 +117,15 @@
         <Directory Id="TARGETDIR" Name="SourceDir">
             <Directory Id="DesktopFolder" Name="Desktop">
                 <Component Id="ApplicationShortcutDesktop" Guid="*">
-                    <Shortcut Id="ApplicationDesktopShortcut" Name="{{product_name}}" Description="Runs {{product_name}}" Target="[!Path]" WorkingDirectory="INSTALLDIR" />
+                    <!-- Fresh install: create it. Upgrade: only keep it if the user hasn't deleted it -->
+                    <Condition><![CDATA[NOT WIX_UPGRADE_DETECTED OR DESKTOPSHORTCUTEXISTS]]></Condition>
+                    <Shortcut Id="ApplicationDesktopShortcut"
+                        Name="{{product_name}}"
+                        Description="Runs {{product_name}}"
+                        Target="[!Path]"
+                        WorkingDirectory="INSTALLDIR">
+                        <ShortcutProperty Key="System.AppUserModel.ID" Value="{{bundle_id}}"/>
+                    </Shortcut>
                     <RemoveFolder Id="DesktopFolder" On="uninstall" />
                     <RegistryValue Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="Desktop Shortcut" Type="integer" Value="1" KeyPath="yes" />
                 </Component>
@@ -146,7 +161,7 @@
             </Component>
             <Component Id="Path" Guid="{{path_component_guid}}" Win64="$(var.Win64)">
                 <File Id="Path" Source="{{main_binary_path}}" KeyPath="no" Checksum="yes"/>
-                <RegistryValue Root="HKCU" Key="Software\{{manufacturer}}\{{product_name}}" Name="PathComponent" Type="integer" Value="1" KeyPath="yes" />
+                <RegistryValue Root="HKCU" Key="Software\\{{manufacturer}}\\{{product_name}}" Name="PathComponent" Type="integer" Value="1" KeyPath="yes" />
                 {{#each file_associations as |association| ~}}
                 {{#each association.ext as |ext| ~}}
                 <ProgId Id="{{../../product_name}}.{{ext}}" Advertise="yes" Description="{{association.description}}">
@@ -203,7 +218,6 @@
                     Name="{{product_name}}"
                     Description="Runs {{product_name}}"
                     Target="[!Path]"
-                    Icon="ProductIcon"
                     WorkingDirectory="INSTALLDIR">
                     <ShortcutProperty Key="System.AppUserModel.ID" Value="{{bundle_id}}"/>
                 </Shortcut>

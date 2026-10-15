@@ -8,17 +8,23 @@ import {
 } from "@dnd-kit/core";
 import { arrayMove, sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { useTranslation } from "react-i18next";
 import type { Provider } from "@/types";
 import { providersApi, type AppId } from "@/lib/api";
+import { isProxyAppId } from "@/config/appConfig";
 
 export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
   const queryClient = useQueryClient();
   const { t, i18n } = useTranslation();
 
   const sortedProviders = useMemo(() => {
-    const locale = i18n.language === "zh" ? "zh-CN" : "en-US";
+    const locale =
+      i18n.language === "zh"
+        ? "zh-CN"
+        : i18n.language === "zh-TW"
+          ? "zh-TW"
+          : "en-US";
     return Object.values(providers).sort((a, b) => {
       if (a.sortIndex !== undefined && b.sortIndex !== undefined) {
         return a.sortIndex - b.sortIndex;
@@ -75,6 +81,13 @@ export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
           queryKey: ["providers", appId],
         });
 
+        // Routing apps derive failover order from sort_index.
+        if (isProxyAppId(appId)) {
+          await queryClient.invalidateQueries({
+            queryKey: ["failoverQueue", appId],
+          });
+        }
+
         // 更新托盘菜单以反映新的排序（失败不影响主操作）
         try {
           await providersApi.updateTrayMenu();
@@ -87,6 +100,7 @@ export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
           t("provider.sortUpdated", {
             defaultValue: "排序已更新",
           }),
+          { closeButton: true },
         );
       } catch (error) {
         console.error("Failed to update provider sort order", error);

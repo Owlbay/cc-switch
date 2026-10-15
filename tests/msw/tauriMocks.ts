@@ -1,8 +1,17 @@
-import "cross-fetch/polyfill";
+import crossFetch, {
+  Headers as CrossFetchHeaders,
+  Request as CrossFetchRequest,
+  Response as CrossFetchResponse,
+} from "cross-fetch";
 import { vi } from "vitest";
 import { server } from "./server";
 
 const TAURI_ENDPOINT = "http://tauri.local";
+
+globalThis.fetch = crossFetch as typeof fetch;
+globalThis.Headers = CrossFetchHeaders as typeof Headers;
+globalThis.Request = CrossFetchRequest as typeof Request;
+globalThis.Response = CrossFetchResponse as typeof Response;
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: async (command: string, payload: Record<string, unknown> = {}) => {
@@ -29,10 +38,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
-const listeners = new Map<
-  string,
-  Set<(event: { payload: unknown }) => void>
->();
+const listeners = new Map<string, Set<(event: { payload: unknown }) => void>>();
 
 const ensureListenerSet = (event: string) => {
   if (!listeners.has(event)) {
@@ -47,7 +53,10 @@ export const emitTauriEvent = (event: string, payload: unknown) => {
 };
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: async (event: string, handler: (event: { payload: unknown }) => void) => {
+  listen: async (
+    event: string,
+    handler: (event: { payload: unknown }) => void,
+  ) => {
     const set = ensureListenerSet(event);
     set.add(handler);
     return () => {

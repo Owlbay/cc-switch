@@ -1,14 +1,30 @@
-import React from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
-import { Wand2 } from "lucide-react";
-import { toast } from "sonner";
-import { formatJSON } from "@/utils/formatters";
+import JsonEditor from "@/components/JsonEditor";
+import type { ProviderEditorInactiveField } from "@/lib/api/providers";
+import { InactiveFieldsPanel } from "./InactiveFieldsPanel";
+import {
+  extractCodexTopLevelInt,
+  isCodexRemoteCompactionEnabled,
+  removeCodexTopLevelField,
+  setCodexRemoteCompaction,
+  setCodexTopLevelInt,
+} from "@/utils/providerConfigUtils";
+import { fieldClass } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 
 interface CodexAuthSectionProps {
   value: string;
   onChange: (value: string) => void;
   onBlur?: () => void;
   error?: string;
+  isProxyTakeover?: boolean;
 }
 
 /**
@@ -19,25 +35,30 @@ export const CodexAuthSection: React.FC<CodexAuthSectionProps> = ({
   onChange,
   onBlur,
   error,
+  isProxyTakeover = false,
 }) => {
   const { t } = useTranslation();
+  const [isDarkMode, setIsDarkMode] = useState(false);
 
-  const handleFormat = () => {
-    if (!value.trim()) return;
+  useEffect(() => {
+    setIsDarkMode(document.documentElement.classList.contains("dark"));
 
-    try {
-      const formatted = formatJSON(value);
-      onChange(formatted);
-      toast.success(t("common.formatSuccess", { defaultValue: "格式化成功" }));
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      toast.error(
-        t("common.formatError", {
-          defaultValue: "格式化失败：{{error}}",
-          error: errorMessage,
-        }),
-      );
+    const observer = new MutationObserver(() => {
+      setIsDarkMode(document.documentElement.classList.contains("dark"));
+    });
+
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+
+    return () => observer.disconnect();
+  }, []);
+
+  const handleChange = (newValue: string) => {
+    onChange(newValue);
+    if (onBlur) {
+      onBlur();
     }
   };
 
@@ -45,48 +66,30 @@ export const CodexAuthSection: React.FC<CodexAuthSectionProps> = ({
     <div className="space-y-2">
       <label
         htmlFor="codexAuth"
-        className="block text-sm font-medium text-gray-900 dark:text-gray-100"
+        className="block text-sm font-medium text-fg-1"
       >
         {t("codexConfig.authJson")}
       </label>
 
-      <textarea
-        id="codexAuth"
+      <JsonEditor
         value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onBlur={onBlur}
+        onChange={handleChange}
         placeholder={t("codexConfig.authJsonPlaceholder")}
-        rows={6}
-        className="w-full px-3 py-2 border border-border-default  dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20  transition-colors resize-y min-h-[8rem]"
-        autoComplete="off"
-        autoCorrect="off"
-        autoCapitalize="none"
-        spellCheck={false}
-        lang="en"
-        inputMode="text"
-        data-gramm="false"
-        data-gramm_editor="false"
-        data-enable-grammarly="false"
+        darkMode={isDarkMode}
+        rows={3}
+        showValidation={true}
+        language="json"
       />
 
-      <div className="flex items-center justify-between">
-        <button
-          type="button"
-          onClick={handleFormat}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
-        >
-          <Wand2 className="w-3.5 h-3.5" />
-          {t("common.format", { defaultValue: "格式化" })}
-        </button>
-
-        {error && (
-          <p className="text-xs text-red-500 dark:text-red-400">{error}</p>
-        )}
-      </div>
+      {error && <p className="text-xs text-danger-text">{error}</p>}
 
       {!error && (
-        <p className="text-xs text-gray-500 dark:text-gray-400">
-          {t("codexConfig.authJsonHint")}
+        <p className="text-xs text-fg-2">
+          {t(
+            isProxyTakeover
+              ? "codexConfig.authJsonStorageHint"
+              : "codexConfig.authJsonHint",
+          )}
         </p>
       )}
     </div>
@@ -96,11 +99,12 @@ export const CodexAuthSection: React.FC<CodexAuthSectionProps> = ({
 interface CodexConfigSectionProps {
   value: string;
   onChange: (value: string) => void;
-  useCommonConfig: boolean;
-  onCommonConfigToggle: (checked: boolean) => void;
-  onEditCommonConfig: () => void;
-  commonConfigError?: string;
+  providerName?: string;
+  showRemoteCompaction?: boolean;
   configError?: string;
+  isProxyTakeover?: boolean;
+  /** 行里保存着、但不随切换生效的全局设置（值是可以照抄的 TOML）。 */
+  inactiveFields?: ProviderEditorInactiveField[];
 }
 
 /**
@@ -109,76 +113,227 @@ interface CodexConfigSectionProps {
 export const CodexConfigSection: React.FC<CodexConfigSectionProps> = ({
   value,
   onChange,
-  useCommonConfig,
-  onCommonConfigToggle,
-  onEditCommonConfig,
-  commonConfigError,
+  providerName,
+  showRemoteCompaction = true,
   configError,
+  isProxyTakeover = false,
+  inactiveFields = [],
 }) => {
   const { t } = useTranslation();
+  const [isDarkMode, setIsDarkMode] = useState(false);
+
+  useEffect(() => {
+    setIsDarkMode(document.documentElement.classList.contains("dark"));
+
+    const observer = new MutationObserver(() => {
+      setIsDarkMode(document.documentElement.classList.contains("dark"));
+    });
+
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class"],
+    });
+
+    return () => observer.disconnect();
+  }, []);
+
+  // Mirror value prop to local state (same pattern as CommonConfigEditor)
+  const [localValue, setLocalValue] = useState(value);
+  const localValueRef = useRef(value);
+  useEffect(() => {
+    setLocalValue(value);
+    localValueRef.current = value;
+  }, [value]);
+
+  const handleLocalChange = useCallback(
+    (newValue: string) => {
+      if (newValue === localValueRef.current) return;
+      localValueRef.current = newValue;
+      setLocalValue(newValue);
+      onChange(newValue);
+    },
+    [onChange],
+  );
+
+  const remoteCompactionEnabled = useMemo(
+    () => isCodexRemoteCompactionEnabled(localValue),
+    [localValue],
+  );
+
+  const handleRemoteCompactionToggle = useCallback(
+    (checked: boolean) => {
+      handleLocalChange(
+        setCodexRemoteCompaction(
+          localValueRef.current || "",
+          checked,
+          providerName,
+        ),
+      );
+    },
+    [handleLocalChange, providerName],
+  );
+
+  // Parse toggle states from TOML text
+  const toggleStates = useMemo(() => {
+    const contextWindow = extractCodexTopLevelInt(
+      localValue,
+      "model_context_window",
+    );
+    const compactLimit = extractCodexTopLevelInt(
+      localValue,
+      "model_auto_compact_token_limit",
+    );
+    return {
+      contextWindow1M: contextWindow === 1000000,
+      compactLimit: compactLimit ?? 900000,
+    };
+  }, [localValue]);
+
+  // Debounce timer for compact limit input
+  const compactTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  const handleContextWindowToggle = useCallback(
+    (checked: boolean) => {
+      let toml = localValueRef.current || "";
+      if (checked) {
+        toml = setCodexTopLevelInt(toml, "model_context_window", 1000000);
+        // Auto-set compact limit if not already present
+        if (
+          extractCodexTopLevelInt(toml, "model_auto_compact_token_limit") ===
+          undefined
+        ) {
+          toml = setCodexTopLevelInt(
+            toml,
+            "model_auto_compact_token_limit",
+            900000,
+          );
+        }
+      } else {
+        toml = removeCodexTopLevelField(toml, "model_context_window");
+        toml = removeCodexTopLevelField(toml, "model_auto_compact_token_limit");
+      }
+      handleLocalChange(toml);
+    },
+    [handleLocalChange],
+  );
+
+  const handleCompactLimitChange = useCallback(
+    (inputValue: string) => {
+      clearTimeout(compactTimerRef.current);
+      compactTimerRef.current = setTimeout(() => {
+        const num = parseInt(inputValue, 10);
+        if (!Number.isNaN(num) && num > 0) {
+          handleLocalChange(
+            setCodexTopLevelInt(
+              localValueRef.current || "",
+              "model_auto_compact_token_limit",
+              num,
+            ),
+          );
+        }
+      }, 500);
+    },
+    [handleLocalChange],
+  );
+
+  // Cleanup debounce timer
+  useEffect(() => {
+    return () => clearTimeout(compactTimerRef.current);
+  }, []);
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <label
           htmlFor="codexConfig"
-          className="block text-sm font-medium text-gray-900 dark:text-gray-100"
+          className="block text-sm font-medium text-fg-1"
         >
           {t("codexConfig.configToml")}
         </label>
 
-        <label className="inline-flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 cursor-pointer">
+        <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1">
+          {showRemoteCompaction && (
+            <label
+              className="inline-flex cursor-pointer items-center gap-2 text-sm text-fg-2"
+              title={t("codexConfig.remoteCompactionHint")}
+            >
+              <input
+                type="checkbox"
+                checked={remoteCompactionEnabled}
+                onChange={(e) => handleRemoteCompactionToggle(e.target.checked)}
+                className="ui-checkbox"
+              />
+              {t("codexConfig.enableRemoteCompaction")}
+            </label>
+          )}
+        </div>
+      </div>
+
+      <p className="text-xs text-fg-2">
+        {t("codexConfig.keyFieldsHint", {
+          defaultValue:
+            "地址、Key、模型、推理档位、上下文窗口和兼容开关随供应商切换；其余是 Codex 全局设置，保存后对所有供应商生效。",
+        })}
+      </p>
+
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
           <input
             type="checkbox"
-            checked={useCommonConfig}
-            onChange={(e) => onCommonConfigToggle(e.target.checked)}
-            className="w-4 h-4 text-blue-500 bg-white dark:bg-gray-800 border-border-default  rounded focus:ring-blue-500 dark:focus:ring-blue-400 focus:ring-2"
+            checked={toggleStates.contextWindow1M}
+            onChange={(e) => handleContextWindowToggle(e.target.checked)}
+            className="ui-checkbox"
           />
-          {t("codexConfig.writeCommonConfig")}
+          <span>{t("codexConfig.contextWindow1M")}</span>
+        </label>
+        <label className="inline-flex items-center gap-2 text-sm text-fg-2">
+          <span>{t("codexConfig.autoCompactLimit")}:</span>
+          <input
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            key={toggleStates.compactLimit}
+            defaultValue={toggleStates.compactLimit}
+            disabled={!toggleStates.contextWindow1M}
+            onChange={(e) => handleCompactLimitChange(e.target.value)}
+            className={cn(fieldClass, "h-7 w-28 px-2")}
+          />
         </label>
       </div>
 
-      <div className="flex items-center justify-end">
-        <button
-          type="button"
-          onClick={onEditCommonConfig}
-          className="text-xs text-blue-500 dark:text-blue-400 hover:underline"
-        >
-          {t("codexConfig.editCommonConfig")}
-        </button>
-      </div>
-
-      {commonConfigError && (
-        <p className="text-xs text-red-500 dark:text-red-400 text-right">
-          {commonConfigError}
-        </p>
-      )}
-
-      <textarea
-        id="codexConfig"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
+      <JsonEditor
+        value={localValue}
+        onChange={handleLocalChange}
         placeholder=""
-        rows={8}
-        className="w-full px-3 py-2 border border-border-default  dark:bg-gray-800 dark:text-gray-100 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:focus:ring-blue-400/20  transition-colors resize-y min-h-[10rem]"
-        autoComplete="off"
-        autoCorrect="off"
-        autoCapitalize="none"
-        spellCheck={false}
-        lang="en"
-        inputMode="text"
-        data-gramm="false"
-        data-gramm_editor="false"
-        data-enable-grammarly="false"
+        darkMode={isDarkMode}
+        rows={3}
+        showValidation={false}
+        language="javascript"
       />
 
-      {configError && (
-        <p className="text-xs text-red-500 dark:text-red-400">{configError}</p>
-      )}
+      <InactiveFieldsPanel
+        fields={inactiveFields}
+        hint={t("codexConfig.inactiveFieldsHint", {
+          defaultValue:
+            "这些是旧版存进卡里的设置，现在切换不会写出去。点一下复制 TOML，需要时粘贴到上方。",
+        })}
+        action={{
+          kind: "copy",
+          copiedText: t("codexConfig.inactiveFieldCopied", {
+            defaultValue: "已复制",
+          }),
+        }}
+      />
+
+      {configError && <p className="text-xs text-danger-text">{configError}</p>}
 
       {!configError && (
-        <p className="text-xs text-gray-500 dark:text-gray-400">
-          {t("codexConfig.configTomlHint")}
+        <p className="text-xs text-fg-2">
+          {t(
+            isProxyTakeover
+              ? "codexConfig.configTomlStorageHint"
+              : "codexConfig.configTomlHint",
+          )}
         </p>
       )}
     </div>

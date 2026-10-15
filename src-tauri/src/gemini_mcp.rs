@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,14 +5,6 @@ use std::path::{Path, PathBuf};
 use crate::config::atomic_write;
 use crate::error::AppError;
 use crate::gemini_config::get_gemini_settings_path;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct McpStatus {
-    pub user_config_path: String,
-    pub user_config_exists: bool,
-    pub server_count: usize,
-}
 
 /// 获取 Gemini MCP 配置文件路径（~/.gemini/settings.json）
 fn user_config_path() -> PathBuf {
@@ -38,17 +29,12 @@ fn write_json_value(path: &Path, value: &Value) -> Result<(), AppError> {
     atomic_write(path, json.as_bytes())
 }
 
-/// 读取 Gemini MCP 配置文件的完整 JSON 文本
-pub fn read_mcp_json() -> Result<Option<String>, AppError> {
-    let path = user_config_path();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
-    Ok(Some(content))
-}
-
 /// 读取 Gemini settings.json 中的 mcpServers 映射
+///
+/// 执行反向格式转换以保持与统一 MCP 结构的兼容性：
+/// - httpUrl → url + type: "http"
+/// - 仅有 url 字段 → 补齐 type: "sse"（Gemini 以字段名推断传输类型）
+/// - 仅有 command 字段 → 补齐 type: "stdio"
 pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>, AppError> {
     let path = user_config_path();
     if !path.exists() {
@@ -56,11 +42,31 @@ pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>
     }
 
     let root = read_json_value(&path)?;
-    let servers = root
+    let mut servers: std::collections::HashMap<String, Value> = root
         .get("mcpServers")
         .and_then(|v| v.as_object())
         .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
+
+    // 反向格式转换：Gemini 特有格式 → 统一 MCP 格式
+    for (_, spec) in servers.iter_mut() {
+        if let Some(obj) = spec.as_object_mut() {
+            // httpUrl → url + type: "http"
+            if let Some(http_url) = obj.remove("httpUrl") {
+                obj.insert("url".to_string(), http_url);
+                obj.insert("type".to_string(), Value::String("http".to_string()));
+            }
+
+            // Gemini CLI 不使用 type 字段：这里补齐成统一结构，便于校验与导入
+            if obj.get("type").is_none() {
+                if obj.contains_key("command") {
+                    obj.insert("type".to_string(), Value::String("stdio".to_string()));
+                } else if obj.contains_key("url") {
+                    obj.insert("type".to_string(), Value::String("sse".to_string()));
+                }
+            }
+        }
+    }
 
     Ok(servers)
 }
@@ -96,7 +102,20 @@ pub fn set_mcp_servers_map(
             obj = server_obj;
         }
 
-        // 移除 UI 辅助字段
+        // Gemini CLI 格式转换：
+        // - Gemini 不使用 "type" 字段（从字段名推断传输类型）
+        // - HTTP 使用 "httpUrl" 字段，SSE 使用 "url" 字段
+        let transport_type = obj.get("type").and_then(|v| v.as_str());
+        if transport_type == Some("http") {
+            // HTTP streaming: 将 "url" 重命名为 "httpUrl"
+            if let Some(url_value) = obj.remove("url") {
+                obj.insert("httpUrl".to_string(), url_value);
+            }
+        }
+        // SSE 保持 "url" 字段不变
+
+        // 移除 UI 辅助字段和 type 字段（Gemini 不需要）
+        obj.remove("type");
         obj.remove("enabled");
         obj.remove("source");
         obj.remove("id");
@@ -105,6 +124,33 @@ pub fn set_mcp_servers_map(
         obj.remove("tags");
         obj.remove("homepage");
         obj.remove("docs");
+
+        // Timeout 转换：Claude/Codex 使用 startup_timeout_sec/tool_timeout_sec
+        // Gemini CLI 只支持 timeout（单位 ms）
+        // 默认值：startup=10s, tool=60s
+        const DEFAULT_STARTUP_MS: u64 = 10_000;
+        const DEFAULT_TOOL_MS: u64 = 60_000;
+
+        let extract_timeout =
+            |obj: &mut Map<String, Value>, key: &str, multiplier: u64| -> Option<u64> {
+                obj.remove(key).and_then(|val| {
+                    val.as_u64()
+                        .map(|n| n * multiplier)
+                        .or_else(|| val.as_f64().map(|f| (f * multiplier as f64) as u64))
+                })
+            };
+
+        // 分别收集 startup 和 tool timeout，未设置时使用默认值
+        let startup_ms = extract_timeout(&mut obj, "startup_timeout_sec", 1000)
+            .or_else(|| extract_timeout(&mut obj, "startup_timeout_ms", 1))
+            .unwrap_or(DEFAULT_STARTUP_MS);
+        let tool_ms = extract_timeout(&mut obj, "tool_timeout_sec", 1000)
+            .or_else(|| extract_timeout(&mut obj, "tool_timeout_ms", 1))
+            .unwrap_or(DEFAULT_TOOL_MS);
+
+        // 取最大值作为 Gemini timeout
+        let final_timeout = startup_ms.max(tool_ms);
+        obj.insert("timeout".to_string(), Value::Number(final_timeout.into()));
 
         out.insert(id.clone(), Value::Object(obj));
     }

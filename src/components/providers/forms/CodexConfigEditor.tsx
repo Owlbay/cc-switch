@@ -1,11 +1,18 @@
-import React, { useState, useEffect } from "react";
+import React from "react";
+import { useTranslation } from "react-i18next";
 import { CodexAuthSection, CodexConfigSection } from "./CodexConfigSections";
-import { CodexCommonConfigModal } from "./CodexCommonConfigModal";
+import type { ProviderEditorInactiveField } from "@/lib/api/providers";
 
 interface CodexConfigEditorProps {
   authValue: string;
 
   configValue: string;
+
+  providerName?: string;
+
+  showRemoteCompaction?: boolean;
+
+  isProxyTakeover?: boolean;
 
   onAuthChange: (value: string) => void;
 
@@ -13,72 +20,57 @@ interface CodexConfigEditorProps {
 
   onAuthBlur?: () => void;
 
-  useCommonConfig: boolean;
-
-  onCommonConfigToggle: (checked: boolean) => void;
-
-  commonConfigSnippet: string;
-
-  onCommonConfigSnippetChange: (value: string) => void;
-
-  commonConfigError: string;
-
   authError: string;
 
   configError: string; // config.toml 错误提示
+
+  /** 行里保存着、但不随切换生效的全局设置。 */
+  inactiveFields?: ProviderEditorInactiveField[];
 }
 
 const CodexConfigEditor: React.FC<CodexConfigEditorProps> = ({
   authValue,
   configValue,
+  providerName,
+  showRemoteCompaction,
+  isProxyTakeover = false,
   onAuthChange,
   onConfigChange,
   onAuthBlur,
-  useCommonConfig,
-  onCommonConfigToggle,
-  commonConfigSnippet,
-  onCommonConfigSnippetChange,
-  commonConfigError,
   authError,
   configError,
+  inactiveFields,
 }) => {
-  const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
-
-  // Auto-open common config modal if there's an error
-  useEffect(() => {
-    if (commonConfigError && !isCommonConfigModalOpen) {
-      setIsCommonConfigModalOpen(true);
-    }
-  }, [commonConfigError, isCommonConfigModalOpen]);
+  const { t } = useTranslation();
 
   return (
     <div className="space-y-6">
+      {isProxyTakeover && (
+        <div className="p-3 bg-warning-soft border border-transparent rounded-lg">
+          <p className="text-xs text-warning-text">
+            {t("codexConfig.proxyTakeoverStorageNotice")}
+          </p>
+        </div>
+      )}
+
       {/* Auth JSON Section */}
       <CodexAuthSection
         value={authValue}
         onChange={onAuthChange}
         onBlur={onAuthBlur}
         error={authError}
+        isProxyTakeover={isProxyTakeover}
       />
 
       {/* Config TOML Section */}
       <CodexConfigSection
         value={configValue}
         onChange={onConfigChange}
-        useCommonConfig={useCommonConfig}
-        onCommonConfigToggle={onCommonConfigToggle}
-        onEditCommonConfig={() => setIsCommonConfigModalOpen(true)}
-        commonConfigError={commonConfigError}
+        providerName={providerName}
+        showRemoteCompaction={showRemoteCompaction}
         configError={configError}
-      />
-
-      {/* Common Config Modal */}
-      <CodexCommonConfigModal
-        isOpen={isCommonConfigModalOpen}
-        onClose={() => setIsCommonConfigModalOpen(false)}
-        value={commonConfigSnippet}
-        onChange={onCommonConfigSnippetChange}
-        error={commonConfigError}
+        isProxyTakeover={isProxyTakeover}
+        inactiveFields={inactiveFields}
       />
     </div>
   );

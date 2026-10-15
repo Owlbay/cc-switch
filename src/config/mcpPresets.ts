@@ -1,6 +1,27 @@
 import { McpServer, McpServerSpec } from "../types";
+import { isWindows } from "@/lib/platform";
 
 export type McpPreset = Omit<McpServer, "enabled" | "description">;
+
+// 创建跨平台 npx 命令配置
+// Windows 需要使用 cmd /c wrapper 来执行 npx.cmd
+// Mac/Linux 可以直接执行 npx
+const createNpxCommand = (
+  packageName: string,
+  extraArgs: string[] = [],
+): { command: string; args: string[] } => {
+  if (isWindows()) {
+    return {
+      command: "cmd",
+      args: ["/c", "npx", ...extraArgs, packageName],
+    };
+  } else {
+    return {
+      command: "npx",
+      args: [...extraArgs, packageName],
+    };
+  }
+};
 
 // 预设 MCP（逻辑简化版）：
 // - 仅包含最常用、可快速落地的 stdio 模式示例
@@ -22,12 +43,13 @@ export const mcpPresets: McpPreset[] = [
   },
   {
     id: "time",
-    name: "@modelcontextprotocol/server-time",
+    name: "mcp-server-time",
     tags: ["stdio", "time", "utility"],
+    // 官方 time 服务器只发布在 PyPI（mcp-server-time），npm 上没有 @modelcontextprotocol/server-time
     server: {
       type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-time"],
+      command: "uvx",
+      args: ["mcp-server-time"],
     } as McpServerSpec,
     homepage: "https://github.com/modelcontextprotocol/servers",
     docs: "https://github.com/modelcontextprotocol/servers/tree/main/src/time",
@@ -38,8 +60,7 @@ export const mcpPresets: McpPreset[] = [
     tags: ["stdio", "memory", "graph"],
     server: {
       type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-memory"],
+      ...createNpxCommand("@modelcontextprotocol/server-memory", ["-y"]),
     } as McpServerSpec,
     homepage: "https://github.com/modelcontextprotocol/servers",
     docs: "https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
@@ -50,8 +71,9 @@ export const mcpPresets: McpPreset[] = [
     tags: ["stdio", "thinking", "reasoning"],
     server: {
       type: "stdio",
-      command: "npx",
-      args: ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      ...createNpxCommand("@modelcontextprotocol/server-sequential-thinking", [
+        "-y",
+      ]),
     } as McpServerSpec,
     homepage: "https://github.com/modelcontextprotocol/servers",
     docs: "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
@@ -62,8 +84,7 @@ export const mcpPresets: McpPreset[] = [
     tags: ["stdio", "docs", "search"],
     server: {
       type: "stdio",
-      command: "npx",
-      args: ["-y", "@upstash/context7-mcp"],
+      ...createNpxCommand("@upstash/context7-mcp", ["-y"]),
     } as McpServerSpec,
     homepage: "https://context7.com",
     docs: "https://github.com/upstash/context7/blob/master/README.md",

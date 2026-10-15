@@ -1,17 +1,62 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { settingsApi, type AppId } from "@/lib/api";
 import type { SettingsFormState } from "./useSettingsForm";
 
-type DirectoryKey = "appConfig" | "claude" | "codex";
+export type DirectoryAppId = Exclude<AppId, "claude-desktop" | "mcode">;
+type AppDirectoryKey =
+  | "claude"
+  | "codex"
+  | "gemini"
+  | "grokbuild"
+  | "opencode"
+  | "openclaw"
+  | "hermes"
+  | "pi";
+type DirectoryKey = "appConfig" | AppDirectoryKey;
 
 export interface ResolvedDirectories {
   appConfig: string;
   claude: string;
   codex: string;
+  gemini: string;
+  grokbuild: string;
+  opencode: string;
+  openclaw: string;
+  hermes: string;
+  pi: string;
 }
+
+// Single source of truth for per-app directory metadata.
+const APP_DIRECTORY_META: Record<
+  DirectoryAppId,
+  { key: AppDirectoryKey; defaultFolder: string }
+> = {
+  claude: { key: "claude", defaultFolder: ".claude" },
+  codex: { key: "codex", defaultFolder: ".codex" },
+  gemini: { key: "gemini", defaultFolder: ".gemini" },
+  grokbuild: { key: "grokbuild", defaultFolder: ".grok" },
+  opencode: { key: "opencode", defaultFolder: ".config/opencode" },
+  openclaw: { key: "openclaw", defaultFolder: ".openclaw" },
+  hermes: { key: "hermes", defaultFolder: ".hermes" },
+  pi: { key: "pi", defaultFolder: ".pi/agent" },
+};
+
+const DIRECTORY_KEY_TO_SETTINGS_FIELD: Record<
+  AppDirectoryKey,
+  keyof SettingsFormState
+> = {
+  claude: "claudeConfigDir",
+  codex: "codexConfigDir",
+  gemini: "geminiConfigDir",
+  grokbuild: "grokConfigDir",
+  opencode: "opencodeConfigDir",
+  openclaw: "openclawConfigDir",
+  hermes: "hermesConfigDir",
+  pi: "piConfigDir",
+};
 
 const sanitizeDir = (value?: string | null): string | undefined => {
   if (!value) return undefined;
@@ -33,12 +78,11 @@ const computeDefaultAppConfigDir = async (): Promise<string | undefined> => {
 };
 
 const computeDefaultConfigDir = async (
-  app: AppId,
+  app: DirectoryAppId,
 ): Promise<string | undefined> => {
   try {
     const home = await homeDir();
-    const folder = app === "claude" ? ".claude" : ".codex";
-    return await join(home, folder);
+    return await join(home, APP_DIRECTORY_META[app].defaultFolder);
   } catch (error) {
     console.error(
       "[useDirectorySettings] Failed to resolve default config dir",
@@ -58,14 +102,20 @@ export interface UseDirectorySettingsResult {
   resolvedDirs: ResolvedDirectories;
   isLoading: boolean;
   initialAppConfigDir?: string;
-  updateDirectory: (app: AppId, value?: string) => void;
+  /** 保存成功后把已保存的数据目录换成刚存的值 */
+  commitAppConfigDir: (value: string | undefined) => void;
+  updateDirectory: (app: DirectoryAppId, value?: string) => void;
   updateAppConfigDir: (value?: string) => void;
-  browseDirectory: (app: AppId) => Promise<void>;
+  browseDirectory: (app: DirectoryAppId) => Promise<void>;
   browseAppConfigDir: () => Promise<void>;
-  resetDirectory: (app: AppId) => Promise<void>;
+  resetDirectory: (app: DirectoryAppId) => Promise<void>;
   resetAppConfigDir: () => Promise<void>;
-  resetAllDirectories: (claudeDir?: string, codexDir?: string) => void;
+  resetAllDirectories: (overrides?: ResolvedAppDirectoryOverrides) => void;
 }
+
+export type ResolvedAppDirectoryOverrides = Partial<
+  Record<AppDirectoryKey, string | undefined>
+>;
 
 /**
  * useDirectorySettings - 目录管理
@@ -89,6 +139,12 @@ export function useDirectorySettings({
     appConfig: "",
     claude: "",
     codex: "",
+    gemini: "",
+    grokbuild: "",
+    opencode: "",
+    openclaw: "",
+    hermes: "",
+    pi: "",
   });
   const [isLoading, setIsLoading] = useState(true);
 
@@ -96,8 +152,23 @@ export function useDirectorySettings({
     appConfig: "",
     claude: "",
     codex: "",
+    gemini: "",
+    grokbuild: "",
+    opencode: "",
+    openclaw: "",
+    hermes: "",
+    pi: "",
   });
+  // 已保存的数据目录（保存按钮和「需要重启」都和它比）。ref 给回调用，state 让比较它的
+  // 组件在保存后重渲染：保存成功要把它更新成刚存的值，否则保存按钮一直在、改回去存不了
   const initialAppConfigDirRef = useRef<string | undefined>(undefined);
+  const [initialAppConfigDir, setInitialAppConfigDir] = useState<
+    string | undefined
+  >(undefined);
+  const commitAppConfigDir = useCallback((value: string | undefined) => {
+    initialAppConfigDirRef.current = value;
+    setInitialAppConfigDir(value);
+  }, []);
 
   // 加载目录信息
   useEffect(() => {
@@ -110,16 +181,40 @@ export function useDirectorySettings({
           overrideRaw,
           claudeDir,
           codexDir,
+          geminiDir,
+          grokDir,
+          opencodeDir,
+          openclawDir,
+          hermesDir,
+          piDir,
           defaultAppConfig,
           defaultClaudeDir,
           defaultCodexDir,
+          defaultGeminiDir,
+          defaultGrokDir,
+          defaultOpencodeDir,
+          defaultOpenclawDir,
+          defaultHermesDir,
+          defaultPiDir,
         ] = await Promise.all([
           settingsApi.getAppConfigDirOverride(),
           settingsApi.getConfigDir("claude"),
           settingsApi.getConfigDir("codex"),
+          settingsApi.getConfigDir("gemini"),
+          settingsApi.getConfigDir("grokbuild"),
+          settingsApi.getConfigDir("opencode"),
+          settingsApi.getConfigDir("openclaw"),
+          settingsApi.getConfigDir("hermes"),
+          settingsApi.getConfigDir("pi"),
           computeDefaultAppConfigDir(),
           computeDefaultConfigDir("claude"),
           computeDefaultConfigDir("codex"),
+          computeDefaultConfigDir("gemini"),
+          computeDefaultConfigDir("grokbuild"),
+          computeDefaultConfigDir("opencode"),
+          computeDefaultConfigDir("openclaw"),
+          computeDefaultConfigDir("hermes"),
+          computeDefaultConfigDir("pi"),
         ]);
 
         if (!active) return;
@@ -130,15 +225,27 @@ export function useDirectorySettings({
           appConfig: defaultAppConfig ?? "",
           claude: defaultClaudeDir ?? "",
           codex: defaultCodexDir ?? "",
+          gemini: defaultGeminiDir ?? "",
+          grokbuild: defaultGrokDir ?? "",
+          opencode: defaultOpencodeDir ?? "",
+          openclaw: defaultOpenclawDir ?? "",
+          hermes: defaultHermesDir ?? "",
+          pi: defaultPiDir ?? "",
         };
 
         setAppConfigDir(normalizedOverride);
-        initialAppConfigDirRef.current = normalizedOverride;
+        commitAppConfigDir(normalizedOverride);
 
         setResolvedDirs({
           appConfig: normalizedOverride ?? defaultsRef.current.appConfig,
           claude: claudeDir || defaultsRef.current.claude,
           codex: codexDir || defaultsRef.current.codex,
+          gemini: geminiDir || defaultsRef.current.gemini,
+          grokbuild: grokDir || defaultsRef.current.grokbuild,
+          opencode: opencodeDir || defaultsRef.current.opencode,
+          openclaw: openclawDir || defaultsRef.current.openclaw,
+          hermes: hermesDir || defaultsRef.current.hermes,
+          pi: piDir || defaultsRef.current.pi,
         });
       } catch (error) {
         console.error(
@@ -158,23 +265,89 @@ export function useDirectorySettings({
     };
   }, []);
 
+  const previousSettingsRef = useRef(settings);
+  const localDirectoryUpdatesRef = useRef<ResolvedAppDirectoryOverrides>({});
+  const directoryRevisionsRef = useRef<
+    Partial<Record<AppDirectoryKey, number>>
+  >({});
+  useEffect(() => {
+    const previousSettings = previousSettingsRef.current;
+    previousSettingsRef.current = settings;
+    if (!previousSettings || !settings) return;
+
+    // Refetch can discard a draft. Resolve cleared overrides through the backend,
+    // whose defaults may depend on the platform or environment variables.
+    for (const { key } of Object.values(APP_DIRECTORY_META)) {
+      const field = DIRECTORY_KEY_TO_SETTINGS_FIELD[key];
+      const value = sanitizeDir(settings[field] as string | undefined);
+      if (
+        value === sanitizeDir(previousSettings[field] as string | undefined)
+      ) {
+        continue;
+      }
+      if (
+        key in localDirectoryUpdatesRef.current &&
+        localDirectoryUpdatesRef.current[key] === value
+      ) {
+        delete localDirectoryUpdatesRef.current[key];
+        continue;
+      }
+      delete localDirectoryUpdatesRef.current[key];
+      const revision = (directoryRevisionsRef.current[key] ?? 0) + 1;
+      directoryRevisionsRef.current[key] = revision;
+      setResolvedDirs((prev) => ({ ...prev, [key]: value ?? "" }));
+      if (value !== undefined) continue;
+
+      void settingsApi.getConfigDir(key).then(
+        (resolved) => {
+          setResolvedDirs((prev) =>
+            directoryRevisionsRef.current[key] === revision
+              ? { ...prev, [key]: resolved }
+              : prev,
+          );
+        },
+        (error) => {
+          console.error(
+            "[useDirectorySettings] Failed to resolve config dir",
+            error,
+          );
+        },
+      );
+    }
+  }, [settings]);
+
+  useEffect(
+    () => () => {
+      for (const { key } of Object.values(APP_DIRECTORY_META)) {
+        directoryRevisionsRef.current[key] =
+          (directoryRevisionsRef.current[key] ?? 0) + 1;
+      }
+    },
+    [],
+  );
+
   const updateDirectoryState = useCallback(
     (key: DirectoryKey, value?: string) => {
       const sanitized = sanitizeDir(value);
       if (key === "appConfig") {
         setAppConfigDir(sanitized);
       } else {
-        onUpdateSettings(
-          key === "claude"
-            ? { claudeConfigDir: sanitized }
-            : { codexConfigDir: sanitized },
-        );
+        const field = DIRECTORY_KEY_TO_SETTINGS_FIELD[key];
+        // Local edits already update the display below. Do not resolve a local
+        // reset against the old persisted override, or let an older read win.
+        directoryRevisionsRef.current[key] =
+          (directoryRevisionsRef.current[key] ?? 0) + 1;
+        localDirectoryUpdatesRef.current[key] = sanitized;
+        onUpdateSettings({ [field]: sanitized });
       }
 
-      setResolvedDirs((prev) => ({
-        ...prev,
-        [key]: sanitized ?? defaultsRef.current[key],
-      }));
+      setResolvedDirs((prev) => {
+        const next = sanitized ?? defaultsRef.current[key];
+        // Same-ref early-return: unchanged value shouldn't cascade renders
+        // through the settings tree.
+        if (prev[key] === next) return prev;
+        return { ...prev, [key]: next };
+      });
     },
     [onUpdateSettings],
   );
@@ -187,19 +360,18 @@ export function useDirectorySettings({
   );
 
   const updateDirectory = useCallback(
-    (app: AppId, value?: string) => {
-      updateDirectoryState(app === "claude" ? "claude" : "codex", value);
+    (app: DirectoryAppId, value?: string) => {
+      updateDirectoryState(APP_DIRECTORY_META[app].key, value);
     },
     [updateDirectoryState],
   );
 
   const browseDirectory = useCallback(
-    async (app: AppId) => {
-      const key: DirectoryKey = app === "claude" ? "claude" : "codex";
+    async (app: DirectoryAppId) => {
+      const key = APP_DIRECTORY_META[app].key;
+      const settingsField = DIRECTORY_KEY_TO_SETTINGS_FIELD[key];
       const currentValue =
-        key === "claude"
-          ? (settings?.claudeConfigDir ?? resolvedDirs.claude)
-          : (settings?.codexConfigDir ?? resolvedDirs.codex);
+        (settings?.[settingsField] as string | undefined) ?? resolvedDirs[key];
 
       try {
         const picked = await settingsApi.selectConfigDirectory(currentValue);
@@ -239,8 +411,8 @@ export function useDirectorySettings({
   }, [appConfigDir, resolvedDirs.appConfig, t, updateDirectoryState]);
 
   const resetDirectory = useCallback(
-    async (app: AppId) => {
-      const key: DirectoryKey = app === "claude" ? "claude" : "codex";
+    async (app: DirectoryAppId) => {
+      const key = APP_DIRECTORY_META[app].key;
       if (!defaultsRef.current[key]) {
         const fallback = await computeDefaultConfigDir(app);
         if (fallback) {
@@ -269,13 +441,23 @@ export function useDirectorySettings({
   }, [updateDirectoryState]);
 
   const resetAllDirectories = useCallback(
-    (claudeDir?: string, codexDir?: string) => {
+    (overrides?: ResolvedAppDirectoryOverrides) => {
+      for (const { key } of Object.values(APP_DIRECTORY_META)) {
+        directoryRevisionsRef.current[key] =
+          (directoryRevisionsRef.current[key] ?? 0) + 1;
+      }
       setAppConfigDir(initialAppConfigDirRef.current);
       setResolvedDirs({
         appConfig:
           initialAppConfigDirRef.current ?? defaultsRef.current.appConfig,
-        claude: claudeDir ?? defaultsRef.current.claude,
-        codex: codexDir ?? defaultsRef.current.codex,
+        claude: overrides?.claude ?? defaultsRef.current.claude,
+        codex: overrides?.codex ?? defaultsRef.current.codex,
+        gemini: overrides?.gemini ?? defaultsRef.current.gemini,
+        grokbuild: overrides?.grokbuild ?? defaultsRef.current.grokbuild,
+        opencode: overrides?.opencode ?? defaultsRef.current.opencode,
+        openclaw: overrides?.openclaw ?? defaultsRef.current.openclaw,
+        hermes: overrides?.hermes ?? defaultsRef.current.hermes,
+        pi: overrides?.pi ?? defaultsRef.current.pi,
       });
     },
     [],
@@ -285,7 +467,8 @@ export function useDirectorySettings({
     appConfigDir,
     resolvedDirs,
     isLoading,
-    initialAppConfigDir: initialAppConfigDirRef.current,
+    initialAppConfigDir,
+    commitAppConfigDir,
     updateDirectory,
     updateAppConfigDir,
     browseDirectory,

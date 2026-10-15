@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use indexmap::IndexMap;
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -82,12 +83,8 @@ pub async fn upsert_mcp_server_in_config(
 
     // 读取现有的服务器（如果存在）
     let existing_server = {
-        let cfg = state.config.read().map_err(|e| e.to_string())?;
-        if let Some(servers) = &cfg.mcp.servers {
-            servers.get(&id).cloned()
-        } else {
-            None
-        }
+        let servers = state.db.get_all_mcp_servers().map_err(|e| e.to_string())?;
+        servers.get(&id).cloned()
     };
 
     // 构建新的统一服务器结构
@@ -125,6 +122,7 @@ pub async fn upsert_mcp_server_in_config(
         new_server.apps.claude = true;
         new_server.apps.codex = true;
         new_server.apps.gemini = true;
+        new_server.apps.opencode = true;
     }
 
     McpService::upsert_server(&state, new_server)
@@ -165,7 +163,7 @@ use crate::app_config::McpServer;
 #[tauri::command]
 pub async fn get_mcp_servers(
     state: State<'_, AppState>,
-) -> Result<HashMap<String, McpServer>, String> {
+) -> Result<IndexMap<String, McpServer>, String> {
     McpService::get_all_servers(&state).map_err(|e| e.to_string())
 }
 
@@ -194,4 +192,28 @@ pub async fn toggle_mcp_app(
 ) -> Result<(), String> {
     let app_ty = AppType::from_str(&app).map_err(|e| e.to_string())?;
     McpService::toggle_app(&state, &server_id, app_ty, enabled).map_err(|e| e.to_string())
+}
+
+/// 从所有应用导入 MCP 服务器（复用已有的导入逻辑）
+#[tauri::command]
+pub async fn import_mcp_from_apps(state: State<'_, AppState>) -> Result<usize, String> {
+    McpService::import_from_all_apps(&state).map_err(|e| e.to_string())
+}
+
+/// 按数据库里的开关把 MCP 重新写进各应用的 live 配置，逐应用返回结果。
+///
+/// `apps` 缺省或为空时同步全部受管应用。每个应用先拿它的切换锁再写，
+/// 和切换供应商互斥；单个应用失败（如配置文件解析失败）不影响其余应用。
+#[tauri::command]
+pub async fn resync_mcp_to_apps(
+    state: State<'_, AppState>,
+    apps: Option<Vec<String>>,
+) -> Result<Vec<crate::services::mcp::McpAppSyncOutcome>, String> {
+    let targets = McpService::resync_targets(apps.as_deref()).map_err(|e| e.to_string())?;
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for app in targets {
+        let _guard = state.proxy_service.lock_switch_for_app(app.as_str()).await;
+        outcomes.push(McpService::resync_app(&state, &app));
+    }
+    Ok(outcomes)
 }

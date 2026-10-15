@@ -32,12 +32,18 @@ describe("ImportExportSection Component", () => {
   it("should disable import button and show placeholder when no file selected", () => {
     render(<ImportExportSection {...baseProps} />);
 
-    expect(screen.getByText("settings.noFileSelected")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "settings.import" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "settings.exportConfig" }));
+    // When no file selected, button shows "selectConfigFile" and clicking it opens file dialog
+    expect(
+      screen.getByRole("button", { name: /settings\.selectConfigFile/ }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.exportConfig" }),
+    );
     expect(baseProps.onExport).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "settings.selectConfigFile" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /settings\.selectConfigFile/ }),
+    );
     expect(baseProps.onSelectFile).toHaveBeenCalledTimes(1);
   });
 
@@ -49,8 +55,10 @@ describe("ImportExportSection Component", () => {
       />,
     );
 
-    expect(screen.getByText("config.json")).toBeInTheDocument();
-    const importButton = screen.getByRole("button", { name: "settings.import" });
+    expect(screen.getByText(/config\.json/)).toBeInTheDocument();
+    const importButton = screen.getByRole("button", {
+      name: /settings\.import/,
+    });
     expect(importButton).toBeEnabled();
     fireEvent.click(importButton);
     expect(baseProps.onImport).toHaveBeenCalledTimes(1);

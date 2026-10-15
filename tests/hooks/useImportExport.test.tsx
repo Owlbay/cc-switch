@@ -26,7 +26,8 @@ vi.mock("@/lib/api", () => ({
     importConfigFromFile: (...args: unknown[]) => importConfigMock(...args),
     saveFileDialog: (...args: unknown[]) => saveFileDialogMock(...args),
     exportConfigToFile: (...args: unknown[]) => exportConfigMock(...args),
-    syncCurrentProvidersLive: (...args: unknown[]) => syncCurrentProvidersLiveMock(...args),
+    syncCurrentProvidersLive: (...args: unknown[]) =>
+      syncCurrentProvidersLiveMock(...args),
   },
 }));
 
@@ -95,9 +96,7 @@ describe("useImportExport Hook", () => {
     });
     const onImportSuccess = vi.fn();
 
-    const { result } = renderHook(() =>
-      useImportExport({ onImportSuccess }),
-    );
+    const { result } = renderHook(() => useImportExport({ onImportSuccess }));
 
     await act(async () => {
       await result.current.selectImportFile();
@@ -111,12 +110,6 @@ describe("useImportExport Hook", () => {
     expect(result.current.status).toBe("success");
     expect(result.current.backupId).toBe("backup-123");
     expect(toastSuccessMock).toHaveBeenCalledTimes(1);
-
-    // Skip delay to execute callback
-    await act(async () => {
-      vi.runOnlyPendingTimers();
-    });
-
     expect(onImportSuccess).toHaveBeenCalledTimes(1);
   });
 
@@ -181,6 +174,7 @@ describe("useImportExport Hook", () => {
     expect(exportConfigMock).toHaveBeenCalledWith("/export.json");
     expect(toastSuccessMock).toHaveBeenCalledWith(
       expect.stringContaining("/backup/export.json"),
+      expect.objectContaining({ closeButton: true }),
     );
   });
 

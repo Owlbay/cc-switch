@@ -4,10 +4,17 @@ import type { ProviderCategory } from "@/types";
 import type { ProviderPreset } from "@/config/claudeProviderPresets";
 import type { CodexProviderPreset } from "@/config/codexProviderPresets";
 import type { GeminiProviderPreset } from "@/config/geminiProviderPresets";
+import type { OpenCodeProviderPreset } from "@/config/opencodeProviderPresets";
+import type { ClaudeDesktopProviderPreset } from "@/config/claudeDesktopProviderPresets";
 
 type PresetEntry = {
   id: string;
-  preset: ProviderPreset | CodexProviderPreset | GeminiProviderPreset;
+  preset:
+    | ProviderPreset
+    | CodexProviderPreset
+    | GeminiProviderPreset
+    | OpenCodeProviderPreset
+    | ClaudeDesktopProviderPreset;
 };
 
 interface UseApiKeyLinkProps {
@@ -74,7 +81,13 @@ export function useApiKeyLink({
 
   return {
     shouldShowApiKeyLink:
-      appId === "claude" || appId === "codex" || appId === "gemini"
+      appId === "claude" ||
+      appId === "claude-desktop" ||
+      appId === "codex" ||
+      appId === "gemini" ||
+      appId === "opencode" ||
+      appId === "openclaw" ||
+      appId === "hermes"
         ? shouldShowApiKeyLink
         : false,
     websiteUrl: getWebsiteUrl,

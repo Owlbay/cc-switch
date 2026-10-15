@@ -3,8 +3,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
-import { SettingsDialog } from "@/components/settings/SettingsDialog";
-import { resetProviderState, getSettings, getAppConfigDirOverride } from "../msw/state";
+import type { Settings } from "@/types";
+import { SettingsPage } from "@/components/settings/SettingsPage";
+import {
+  resetProviderState,
+  getSettings,
+  setSettings,
+  getAppConfigDirOverride,
+} from "../msw/state";
 import { server } from "../msw/server";
 
 const toastSuccessMock = vi.fn();
@@ -18,63 +24,34 @@ vi.mock("sonner", () => ({
 }));
 
 vi.mock("@/components/ui/dialog", () => ({
-  Dialog: ({ open, children }: any) => (open ? <div data-testid="dialog-root">{children}</div> : null),
+  Dialog: ({ open, children }: any) =>
+    open ? <div data-testid="dialog-root">{children}</div> : null,
   DialogContent: ({ children }: any) => <div>{children}</div>,
   DialogHeader: ({ children }: any) => <div>{children}</div>,
   DialogFooter: ({ children }: any) => <div>{children}</div>,
   DialogTitle: ({ children }: any) => <h2>{children}</h2>,
+  DialogDescription: ({ children }: any) => <div>{children}</div>,
 }));
 
-const TabsContext = React.createContext<{ value: string; onValueChange?: (value: string) => void }>(
-  {
-    value: "general",
-  },
-);
-
-vi.mock("@/components/ui/tabs", () => {
-  return {
-    Tabs: ({ value, onValueChange, children }: any) => (
-      <TabsContext.Provider value={{ value, onValueChange }}>{children}</TabsContext.Provider>
-    ),
-    TabsList: ({ children }: any) => <div>{children}</div>,
-    TabsTrigger: ({ value, children }: any) => {
-      const ctx = React.useContext(TabsContext);
-      return (
-        <button type="button" onClick={() => ctx.onValueChange?.(value)}>
-          {children}
-        </button>
-      );
-    },
-    TabsContent: ({ value, children }: any) => {
-      const ctx = React.useContext(TabsContext);
-      return ctx.value === value ? <div data-testid={`tab-${value}`}>{children}</div> : null;
-    },
-  };
-});
-
-vi.mock("@/components/settings/LanguageSettings", () => ({
-  LanguageSettings: ({ value, onChange }: any) => (
-    <div>
-      <span>language:{value}</span>
-      <button onClick={() => onChange("en")}>change-language</button>
-    </div>
-  ),
+vi.mock("@/components/theme-provider", () => ({
+  useTheme: () => ({ theme: "system", setTheme: vi.fn() }),
 }));
 
-vi.mock("@/components/settings/ThemeSettings", () => ({
-  ThemeSettings: () => <div data-testid="theme-settings">theme</div>,
+// 「数据」一节的其他卡片有自己的接口，这里只测目录和导入导出
+vi.mock("@/components/settings/BackupListSection", () => ({
+  BackupListSection: () => <div>backup-list-section</div>,
 }));
-
-vi.mock("@/components/settings/WindowSettings", () => ({
-  WindowSettings: ({ onChange }: any) => (
-    <button onClick={() => onChange({ minimizeToTrayOnClose: false })}>window-settings</button>
-  ),
+vi.mock("@/components/settings/WebdavSyncSection", () => ({
+  WebdavSyncSection: () => <div>webdav-sync-section</div>,
+}));
+vi.mock("@/components/settings/LogConfigPanel", () => ({
+  LogConfigPanel: () => <div>log-config-panel</div>,
 }));
 
 vi.mock("@/components/settings/DirectorySettings", async () => {
-  const actual = await vi.importActual<typeof import("@/components/settings/DirectorySettings")>(
-    "@/components/settings/DirectorySettings",
-  );
+  const actual = await vi.importActual<
+    typeof import("@/components/settings/DirectorySettings")
+  >("@/components/settings/DirectorySettings");
   return actual;
 });
 
@@ -107,12 +84,19 @@ vi.mock("@/components/settings/AboutSection", () => ({
   AboutSection: ({ isPortable }: any) => <div>about:{String(isPortable)}</div>,
 }));
 
-const renderDialog = (props?: Partial<React.ComponentProps<typeof SettingsDialog>>) => {
+const renderDialog = (
+  props?: Partial<React.ComponentProps<typeof SettingsPage>>,
+) => {
   const client = new QueryClient();
   return render(
     <QueryClientProvider client={client}>
       <Suspense fallback={<div data-testid="loading">loading</div>}>
-        <SettingsDialog open onOpenChange={() => {}} {...props} />
+        <SettingsPage
+          section="data"
+          onOpenApps={() => {}}
+          onOpenApp={() => {}}
+          {...props}
+        />
       </Suspense>
     </QueryClientProvider>,
   );
@@ -128,13 +112,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("SettingsDialog integration", () => {
+describe("SettingsPage integration", () => {
   it("loads default settings from MSW", async () => {
     renderDialog();
 
-    await waitFor(() => expect(screen.getByText("language:zh")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("settings.tabAdvanced"));
-    const appInput = await screen.findByPlaceholderText("settings.browsePlaceholderApp");
+    const appInput = await screen.findByPlaceholderText(
+      "settings.browsePlaceholderApp",
+    );
     expect((appInput as HTMLInputElement).value).toBe("/home/mock/.cc-switch");
   });
 
@@ -142,12 +126,11 @@ describe("SettingsDialog integration", () => {
     const onImportSuccess = vi.fn();
     renderDialog({ onImportSuccess });
 
-    await waitFor(() => expect(screen.getByText("language:zh")).toBeInTheDocument());
-
-    fireEvent.click(screen.getByText("settings.tabAdvanced"));
-    fireEvent.click(screen.getByText("settings.selectConfigFile"));
+    fireEvent.click(await screen.findByText("settings.selectConfigFile"));
     await waitFor(() =>
-      expect(screen.getByTestId("selected-file").textContent).toContain("/mock/import-settings.json"),
+      expect(screen.getByTestId("selected-file").textContent).toContain(
+        "/mock/import-settings.json",
+      ),
     );
 
     fireEvent.click(screen.getByText("settings.import"));
@@ -161,10 +144,9 @@ describe("SettingsDialog integration", () => {
   it("saves settings and handles restart prompt", async () => {
     renderDialog();
 
-    await waitFor(() => expect(screen.getByText("language:zh")).toBeInTheDocument());
-
-    fireEvent.click(screen.getByText("settings.tabAdvanced"));
-    const appInput = await screen.findByPlaceholderText("settings.browsePlaceholderApp");
+    const appInput = await screen.findByPlaceholderText(
+      "settings.browsePlaceholderApp",
+    );
     fireEvent.change(appInput, { target: { value: "/custom/app" } });
     fireEvent.click(screen.getByText("common.save"));
 
@@ -172,34 +154,37 @@ describe("SettingsDialog integration", () => {
     await screen.findByText("settings.restartRequired");
     fireEvent.click(screen.getByText("settings.restartLater"));
     await waitFor(() =>
-      expect(screen.queryByText("settings.restartRequired")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByText("settings.restartRequired"),
+      ).not.toBeInTheDocument(),
     );
 
     expect(getAppConfigDirOverride()).toBe("/custom/app");
   });
 
-  it("allows browsing and resetting directories", async () => {
+  it("allows browsing and resetting the data directory", async () => {
     renderDialog();
-
-    await waitFor(() => expect(screen.getByText("language:zh")).toBeInTheDocument());
-
-    fireEvent.click(screen.getByText("settings.tabAdvanced"));
-
-    const browseButtons = screen.getAllByTitle("settings.browseDirectory");
-    const resetButtons = screen.getAllByTitle("settings.resetDefault");
 
     const appInput = (await screen.findByPlaceholderText(
       "settings.browsePlaceholderApp",
     )) as HTMLInputElement;
     expect(appInput.value).toBe("/home/mock/.cc-switch");
 
-    fireEvent.click(browseButtons[0]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.browseDirectory" }),
+    );
     await waitFor(() =>
       expect(appInput.value).toBe("/home/mock/.cc-switch/picked"),
     );
 
-    fireEvent.click(resetButtons[0]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "settings.resetDefault" }),
+    );
     await waitFor(() => expect(appInput.value).toBe("/home/mock/.cc-switch"));
+  });
+
+  it("allows browsing and resetting an app's config directory", async () => {
+    renderDialog({ section: "appConfig" });
 
     const claudeInput = (await screen.findByPlaceholderText(
       "settings.browsePlaceholderClaude",
@@ -207,20 +192,198 @@ describe("SettingsDialog integration", () => {
     fireEvent.change(claudeInput, { target: { value: "/custom/claude" } });
     await waitFor(() => expect(claudeInput.value).toBe("/custom/claude"));
 
-    fireEvent.click(browseButtons[1]);
+    const browseButtons = screen.getAllByRole("button", {
+      name: "settings.browseDirectory",
+    });
+    const resetButtons = screen.getAllByRole("button", {
+      name: "settings.resetDefault",
+    });
+    fireEvent.click(browseButtons[0]);
     await waitFor(() =>
       expect(claudeInput.value).toBe("/custom/claude/picked"),
     );
 
-    fireEvent.click(resetButtons[1]);
+    fireEvent.click(resetButtons[0]);
     await waitFor(() => expect(claudeInput.value).toBe("/home/mock/.claude"));
   });
+
+  it.each([undefined, "/saved/claude"])(
+    "discards directory drafts after unrelated autosave with saved directory %s",
+    async (savedDirectory) => {
+      setSettings({ claudeConfigDir: savedDirectory });
+      const resolvedDirectory = savedDirectory ?? "/home/mock/.claude";
+      const saves: Settings[] = [];
+      const syncLive = vi.fn();
+      server.use(
+        http.post("http://tauri.local/get_config_dir", async ({ request }) => {
+          const { app } = (await request.json()) as { app: string };
+          return HttpResponse.json(
+            app === "claude" ? resolvedDirectory : `/default/${app}`,
+          );
+        }),
+        http.post("http://tauri.local/save_settings", async ({ request }) => {
+          const { settings } = (await request.json()) as { settings: Settings };
+          saves.push(settings);
+          setSettings(settings);
+          return HttpResponse.json(true);
+        }),
+        http.post("http://tauri.local/sync_current_providers_live", () => {
+          syncLive();
+          return HttpResponse.json(true);
+        }),
+      );
+      renderDialog({ section: "appConfig" });
+
+      const directory = await screen.findByPlaceholderText(
+        "settings.browsePlaceholderClaude",
+      );
+      expect(directory).toHaveValue(resolvedDirectory);
+      fireEvent.change(directory, { target: { value: "/unsaved/claude" } });
+      expect(directory).toHaveValue("/unsaved/claude");
+      expect(screen.getByRole("button", { name: "common.save" })).toBeEnabled();
+      expect(saves).toHaveLength(0);
+
+      const toggle = screen.getByRole("switch", {
+        name: "settings.skipClaudeOnboarding",
+      });
+      fireEvent.click(toggle);
+      await waitFor(() =>
+        expect(getSettings().skipClaudeOnboarding).toBe(true),
+      );
+      expect(saves[0].claudeConfigDir).toBe(savedDirectory);
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "common.save" }),
+        ).toBeNull(),
+      );
+      await waitFor(() => expect(directory).toHaveValue(resolvedDirectory));
+
+      fireEvent.click(toggle);
+      await waitFor(() =>
+        expect(getSettings().skipClaudeOnboarding).toBe(false),
+      );
+      expect(saves).toHaveLength(2);
+      expect(saves[1].claudeConfigDir).toBe(savedDirectory);
+      expect(directory).toHaveValue(resolvedDirectory);
+      expect(syncLive).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, "/saved/claude"])(
+    "saves directory edits and resets after picker cancellation from %s",
+    async (savedDirectory) => {
+      setSettings({ claudeConfigDir: savedDirectory });
+      const selectDirectory = vi.fn();
+      server.use(
+        http.post("http://tauri.local/get_config_dir", async ({ request }) => {
+          const { app } = (await request.json()) as { app: string };
+          return HttpResponse.json(
+            app === "claude"
+              ? (getSettings().claudeConfigDir ?? "/home/mock/.claude")
+              : `/default/${app}`,
+          );
+        }),
+        http.post("http://tauri.local/save_settings", async ({ request }) => {
+          const { settings } = (await request.json()) as { settings: Settings };
+          // The backend replaces settings, so an omitted override is cleared.
+          setSettings({
+            ...settings,
+            claudeConfigDir: settings.claudeConfigDir,
+          });
+          return HttpResponse.json(true);
+        }),
+        http.post("http://tauri.local/pick_directory", () => {
+          selectDirectory();
+          return HttpResponse.json(null);
+        }),
+      );
+      renderDialog({ section: "appConfig" });
+      const directory = await screen.findByPlaceholderText(
+        "settings.browsePlaceholderClaude",
+      );
+      fireEvent.change(directory, { target: { value: "/edited/claude" } });
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "settings.browseDirectory" })[0],
+      );
+      await waitFor(() => expect(selectDirectory).toHaveBeenCalledOnce());
+      expect(directory).toHaveValue("/edited/claude");
+      expect(getSettings().claudeConfigDir).toBe(savedDirectory);
+
+      fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+      await waitFor(() =>
+        expect(getSettings().claudeConfigDir).toBe("/edited/claude"),
+      );
+      await waitFor(() => expect(toastSuccessMock).toHaveBeenCalledOnce());
+      expect(directory).toHaveValue("/edited/claude");
+      expect(screen.queryByRole("button", { name: "common.save" })).toBeNull();
+
+      fireEvent.click(
+        screen.getAllByRole("button", { name: "settings.resetDefault" })[0],
+      );
+      expect(directory).toHaveValue("/home/mock/.claude");
+      expect(getSettings().claudeConfigDir).toBe("/edited/claude");
+      fireEvent.click(screen.getByRole("button", { name: "common.save" }));
+      await waitFor(() =>
+        expect(getSettings().claudeConfigDir).toBeUndefined(),
+      );
+      await waitFor(() => expect(toastSuccessMock).toHaveBeenCalledTimes(2));
+      expect(directory).toHaveValue("/home/mock/.claude");
+      expect(screen.queryByRole("button", { name: "common.save" })).toBeNull();
+    },
+  );
+
+  it.each([
+    [
+      "hermes",
+      "hermesConfigDir",
+      "settings.browsePlaceholderHermes",
+      "/env/hermes-home",
+    ],
+    ["pi", "piConfigDir", "settings.browsePlaceholderPi", "/env/pi-agent"],
+  ] as const)(
+    "restores backend-resolved %s default after draft discard",
+    async (targetApp, field, placeholder, backendDefault) => {
+      setSettings({ [field]: undefined });
+      const saves: Settings[] = [];
+      server.use(
+        http.post("http://tauri.local/get_config_dir", async ({ request }) => {
+          const { app } = (await request.json()) as { app: string };
+          return HttpResponse.json(
+            app === targetApp ? backendDefault : `/default/${app}`,
+          );
+        }),
+        http.post("http://tauri.local/save_settings", async ({ request }) => {
+          const { settings } = (await request.json()) as { settings: Settings };
+          saves.push(settings);
+          setSettings({ ...settings, [field]: settings[field] });
+          return HttpResponse.json(true);
+        }),
+      );
+      renderDialog({ section: "appConfig" });
+      const directory = await screen.findByPlaceholderText(placeholder);
+      await waitFor(() => expect(directory).toHaveValue(backendDefault));
+      fireEvent.change(directory, { target: { value: `/draft/${targetApp}` } });
+      expect(directory).toHaveValue(`/draft/${targetApp}`);
+      fireEvent.click(
+        screen.getByRole("switch", { name: "settings.skipClaudeOnboarding" }),
+      );
+      await waitFor(() =>
+        expect(getSettings().skipClaudeOnboarding).toBe(true),
+      );
+      await waitFor(() =>
+        expect(
+          screen.queryByRole("button", { name: "common.save" }),
+        ).toBeNull(),
+      );
+      expect(saves[0][field]).toBeUndefined();
+      await waitFor(() => expect(directory).toHaveValue(backendDefault));
+    },
+  );
 
   it("notifies when export fails", async () => {
     renderDialog();
 
-    await waitFor(() => expect(screen.getByText("language:zh")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("settings.tabAdvanced"));
+    await screen.findByText("settings.exportConfig");
 
     server.use(
       http.post("http://tauri.local/save_file_dialog", () =>
@@ -231,7 +394,9 @@ describe("SettingsDialog integration", () => {
 
     await waitFor(() => expect(toastErrorMock).toHaveBeenCalled());
     const cancelMessage = toastErrorMock.mock.calls.at(-1)?.[0] as string;
-    expect(cancelMessage).toMatch(/settings\.selectFileFailed|选择保存位置失败/);
+    expect(cancelMessage).toMatch(
+      /settings\.selectFileFailed|请选择.*保存路径/,
+    );
 
     toastErrorMock.mockClear();
 
