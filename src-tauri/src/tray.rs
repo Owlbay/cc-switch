@@ -895,14 +895,6 @@ fn claude_bound_account_id(app_type: &AppType, provider: &Provider) -> Option<St
         .filter(|id| !id.is_empty())
 }
 
-/// Grok 官方卡绑了授权中心的 xAI 账号（同前端 ProviderCard 的 `grokBoundAccountId`）。
-fn grok_bound_account_id(app_type: &AppType, provider: &Provider) -> Option<String> {
-    if *app_type != AppType::GrokBuild {
-        return None;
-    }
-    crate::services::provider::grok_direct::bound_account(provider)
-}
-
 fn provider_uses_official_subscription(provider: &Provider) -> bool {
     // Managed Codex uses the account-scoped path in tray_usage_source instead
     // of the CLI's app-wide subscription cache.
@@ -935,38 +927,24 @@ enum TrayUsageSource {
 
 /// Keep the tray's refresh and display paths on the same credentials and toggle.
 fn tray_usage_source(app_type: &AppType, provider: &Provider) -> Option<TrayUsageSource> {
-    if *app_type == AppType::Codex {
-        if let Some(account_id) = managed_codex_account_id(provider) {
-            // Match ProviderCard: managed accounts query by default until the
-            // user explicitly disables usage, including older saved providers.
-            let enabled = provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.usage_script.as_ref())
-                .map(|script| script.enabled)
-                .unwrap_or(true);
-            return enabled.then_some(TrayUsageSource::ManagedCodex(account_id));
-        }
-    }
-    if let Some(account_id) = claude_bound_account_id(app_type, provider) {
-        // 同卡片：绑了账号的 Claude 官方卡没保存过开关时默认查额度，用户关掉才不查。
+    // 绑了托管账号的卡（Codex、Claude 官方、Grok 官方）按账号取额度
+    let bound = match app_type {
+        AppType::Codex => managed_codex_account_id(provider).map(TrayUsageSource::ManagedCodex),
+        // Grok 官方卡绑了授权中心的 xAI 账号（同前端 ProviderCard 的 `grokBoundAccountId`）
+        AppType::GrokBuild => crate::services::provider::grok_direct::bound_account(provider)
+            .map(TrayUsageSource::XaiAccount),
+        _ => claude_bound_account_id(app_type, provider).map(TrayUsageSource::ClaudeAccount),
+    };
+    if let Some(source) = bound {
+        // Match ProviderCard: bound accounts query by default until the user
+        // explicitly disables usage, including older saved providers.
         let enabled = provider
             .meta
             .as_ref()
             .and_then(|meta| meta.usage_script.as_ref())
             .map(|script| script.enabled)
             .unwrap_or(true);
-        return enabled.then_some(TrayUsageSource::ClaudeAccount(account_id));
-    }
-    if let Some(account_id) = grok_bound_account_id(app_type, provider) {
-        // 同卡片：绑了账号的 Grok 官方卡默认查额度，用户关掉才不查。
-        let enabled = provider
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.usage_script.as_ref())
-            .map(|script| script.enabled)
-            .unwrap_or(true);
-        return enabled.then_some(TrayUsageSource::XaiAccount(account_id));
+        return enabled.then_some(source);
     }
     // xAI OAuth 的额度属于绑定的 SuperGrok 账号，不是所在应用的客户端登录，仍走脚本路径。
     if provider_uses_official_subscription(provider) && !provider.is_xai_oauth() {
@@ -3316,11 +3294,13 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
                             .map(|_| ())
                     }
                     TrayUsageSource::XaiAccount(account_id) => {
-                        crate::commands::get_xai_oauth_quota(
-                            app_clone,
-                            state,
+                        // 托盘不显示套餐，不多问那一次
+                        crate::commands::query_and_cache_xai_account(
+                            &app_clone,
+                            &state,
+                            &xai_state,
                             Some(account_id),
-                            xai_state,
+                            false,
                         )
                         .await
                         .map(|_| ())

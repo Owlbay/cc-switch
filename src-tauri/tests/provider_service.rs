@@ -3856,8 +3856,19 @@ fn grok_official(id: &str, account: Option<&str>) -> Provider {
     provider
 }
 
-fn grok_auth_with(user: &str) -> serde_json::Value {
-    json!({ GROK_OIDC_SCOPE: { "user_id": user, "key": "at", "refresh_token": "rt" } })
+/// 写一份 Grok CLI 登录的是 `user` 的 `auth.json`，返回路径和内容
+fn write_grok_auth(user: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let auth_path = cc_switch_lib::get_grok_config_path()
+        .parent()
+        .expect("grok dir")
+        .join("auth.json");
+    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+    let auth = serde_json::to_vec_pretty(
+        &json!({ GROK_OIDC_SCOPE: { "user_id": user, "key": "at", "refresh_token": "rt" } }),
+    )
+    .unwrap();
+    std::fs::write(&auth_path, &auth).unwrap();
+    (auth_path, auth)
 }
 
 #[test]
@@ -3867,13 +3878,7 @@ fn grok_follow_cli_card_drops_the_stash_when_cli_is_already_back() {
     reset_test_fs();
     let home = ensure_test_home();
 
-    let auth_path = cc_switch_lib::get_grok_config_path()
-        .parent()
-        .expect("grok dir")
-        .join("auth.json");
-    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
-    let auth = serde_json::to_vec_pretty(&grok_auth_with("native-user")).unwrap();
-    std::fs::write(&auth_path, &auth).unwrap();
+    let (auth_path, auth) = write_grok_auth("native-user");
     let stash_path = home.join(".cc-switch").join("grok-login-stash.json");
     std::fs::create_dir_all(stash_path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -3904,13 +3909,7 @@ fn grok_bound_card_leaves_auth_alone_when_cli_already_uses_the_account() {
     reset_test_fs();
     let home = ensure_test_home();
 
-    let auth_path = cc_switch_lib::get_grok_config_path()
-        .parent()
-        .expect("grok dir")
-        .join("auth.json");
-    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
-    let auth = serde_json::to_vec_pretty(&grok_auth_with("user-a")).unwrap();
-    std::fs::write(&auth_path, &auth).unwrap();
+    let (auth_path, auth) = write_grok_auth("user-a");
 
     let state = create_test_state().expect("state");
     state
@@ -3936,13 +3935,7 @@ fn grok_unbound_and_third_party_cards_do_not_touch_auth() {
     reset_test_fs();
     let _home = ensure_test_home();
 
-    let auth_path = cc_switch_lib::get_grok_config_path()
-        .parent()
-        .expect("grok dir")
-        .join("auth.json");
-    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
-    let auth = serde_json::to_vec_pretty(&grok_auth_with("someone")).unwrap();
-    std::fs::write(&auth_path, &auth).unwrap();
+    let (auth_path, auth) = write_grok_auth("someone");
 
     let state = create_test_state().expect("state");
     state

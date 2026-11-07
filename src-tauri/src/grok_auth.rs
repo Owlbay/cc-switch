@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
+use crate::live::patch::json::{self, JsonStyle};
 use crate::live::patch::{LivePatch, LiveWriteError};
 
 /// 登录暂存文件名（在 CC Switch 的设备目录 `~/.cc-switch` 下）
@@ -63,25 +64,33 @@ pub(crate) struct LiveLogin {
     pub refresh_token: Option<String>,
 }
 
-fn parse_root(path: &Path, content: &[u8]) -> Result<Map<String, Value>, LiveWriteError> {
-    let value: Value = serde_json::from_slice(content).map_err(|e| LiveWriteError::Parse {
-        path: path.to_path_buf(),
-        line: e.line(),
-        column: e.column(),
-        message: e.to_string(),
-    })?;
-    match value {
-        Value::Object(map) => Ok(map),
-        _ => Err(LiveWriteError::Shape {
-            path: path.to_path_buf(),
-            key_path: crate::live::patch::KeyPath::root(),
-            expected: "对象",
-        }),
-    }
+/// 解析 `auth.json`（不存在或空白时为空对象），保留原文件的缩进、换行等格式
+fn parse_root(
+    path: &Path,
+    pre: Option<&[u8]>,
+) -> Result<(Map<String, Value>, JsonStyle), LiveWriteError> {
+    let (doc, style) = json::parse(path, pre)?;
+    let Value::Object(root) = doc else {
+        unreachable!("json::parse 只返回对象")
+    };
+    Ok((root, style))
 }
 
-fn is_blank(content: &[u8]) -> bool {
-    content.iter().all(u8::is_ascii_whitespace)
+fn to_bytes(
+    path: &Path,
+    root: Map<String, Value>,
+    style: &JsonStyle,
+) -> Result<Vec<u8>, LiveWriteError> {
+    json::serialize(path, &Value::Object(root), style)
+}
+
+fn non_empty(entry: &Map<String, Value>, key: &str) -> Option<String> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// 读出 OIDC 那一条的用户和 refresh token；文件不存在、没有这一条或这一条没有 `user_id`
@@ -90,34 +99,18 @@ pub(crate) fn read_live_login(
     path: &Path,
     content: Option<&[u8]>,
 ) -> Result<Option<LiveLogin>, LiveWriteError> {
-    let Some(content) = content.filter(|c| !is_blank(c)) else {
-        return Ok(None);
-    };
-    let root = parse_root(path, content)?;
-    let Some(entry) = root.get(&oidc_scope()).and_then(Value::as_object) else {
-        return Ok(None);
-    };
-    let Some(user_id) = entry
-        .get("user_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(LiveLogin {
-        user_id: user_id.to_string(),
-        email: entry
-            .get("email")
-            .and_then(Value::as_str)
-            .filter(|e| !e.is_empty())
-            .map(str::to_string),
-        refresh_token: entry
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string),
-    }))
+    Ok(read_live_entry(path, content)?
+        .as_ref()
+        .and_then(live_login_of))
+}
+
+/// OIDC 那一条里的登录；没有 `user_id` 时为 `None`
+pub(crate) fn live_login_of(entry: &Map<String, Value>) -> Option<LiveLogin> {
+    Some(LiveLogin {
+        user_id: non_empty(entry, "user_id")?,
+        email: non_empty(entry, "email"),
+        refresh_token: non_empty(entry, "refresh_token"),
+    })
 }
 
 /// 读盘上的 OIDC 登录（读不了、解析不了都当没有）
@@ -134,29 +127,15 @@ fn iso_micros(ms: i64) -> String {
 }
 
 /// 以 `pre` 为底，把 OIDC 那一条换成 `login`。同一个用户时保留 CLI 自己写的其他字段
-/// （名字、头像、团队设置等），换了用户就整条重建，免得留下上一个号的资料。
+/// （名字、头像、团队设置等）；live 里不是这个用户时以 `base`（还原时暂存的原条目，不含
+/// 令牌）为底，没有就整条重建，免得留下上一个号的资料。
 pub(crate) fn merge_login(
     path: &Path,
     pre: Option<&[u8]>,
     login: &GrokCliLogin,
-    now: DateTime<Utc>,
-) -> Result<Vec<u8>, LiveWriteError> {
-    merge_login_with_base(path, pre, login, None, now)
-}
-
-/// 同 [`merge_login`]；live 里不是这个用户时以 `base`（还原时暂存的原条目，不含令牌）为底，
-/// 把 CLI 原来写的名字、头像等资料带回去。
-pub(crate) fn merge_login_with_base(
-    path: &Path,
-    pre: Option<&[u8]>,
-    login: &GrokCliLogin,
     base: Option<&Map<String, Value>>,
-    now: DateTime<Utc>,
 ) -> Result<Vec<u8>, LiveWriteError> {
-    let mut root = match pre.filter(|c| !is_blank(c)) {
-        Some(content) => parse_root(path, content)?,
-        None => Map::new(),
-    };
+    let (mut root, style) = parse_root(path, pre)?;
     let scope = oidc_scope();
     let same_user = |entry: &&Map<String, Value>| {
         entry.get("user_id").and_then(Value::as_str) == Some(login.account_id.as_str())
@@ -169,60 +148,46 @@ pub(crate) fn merge_login_with_base(
         .cloned()
         .unwrap_or_default();
 
-    let mut set = |key: &str, value: Value| {
-        entry.insert(key.to_string(), value);
+    let mut set = |key: &str, value: String| {
+        entry.insert(key.to_string(), Value::String(value));
     };
-    set("key", Value::String(login.access_token.clone()));
-    set("auth_mode", Value::String("oidc".to_string()));
+    set("key", login.access_token.clone());
+    set("auth_mode", "oidc".to_string());
     set(
         "create_time",
-        Value::String(now.to_rfc3339_opts(SecondsFormat::Micros, true)),
+        Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
     );
-    set("user_id", Value::String(login.account_id.clone()));
+    set("user_id", login.account_id.clone());
     if let Some(email) = login.email.as_deref().filter(|e| e.contains('@')) {
-        set("email", Value::String(email.to_string()));
+        set("email", email.to_string());
     }
     set(
         "principal_type",
-        Value::String(
-            login
-                .principal_type
-                .clone()
-                .unwrap_or_else(|| "User".to_string()),
-        ),
+        login
+            .principal_type
+            .clone()
+            .unwrap_or_else(|| "User".to_string()),
     );
     set(
         "principal_id",
-        Value::String(
-            login
-                .principal_id
-                .clone()
-                .unwrap_or_else(|| login.account_id.clone()),
-        ),
+        login
+            .principal_id
+            .clone()
+            .unwrap_or_else(|| login.account_id.clone()),
     );
     if let Some(team_id) = &login.team_id {
-        set("team_id", Value::String(team_id.clone()));
+        set("team_id", team_id.clone());
     }
-    set("refresh_token", Value::String(login.refresh_token.clone()));
-    set("expires_at", Value::String(iso_micros(login.expires_at_ms)));
-    set("oidc_issuer", Value::String(OIDC_ISSUER.to_string()));
+    set("refresh_token", login.refresh_token.clone());
+    set("expires_at", iso_micros(login.expires_at_ms));
+    set("oidc_issuer", OIDC_ISSUER.to_string());
     set(
         "oidc_client_id",
-        Value::String(crate::proxy::providers::xai_oauth_auth::XAI_CLIENT_ID.to_string()),
+        crate::proxy::providers::xai_oauth_auth::XAI_CLIENT_ID.to_string(),
     );
 
     root.insert(scope, Value::Object(entry));
-    to_bytes(path, root)
-}
-
-fn to_bytes(path: &Path, root: Map<String, Value>) -> Result<Vec<u8>, LiveWriteError> {
-    let mut bytes =
-        serde_json::to_vec_pretty(&Value::Object(root)).map_err(|e| LiveWriteError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::other(e),
-        })?;
-    bytes.push(b'\n');
-    Ok(bytes)
+    to_bytes(path, root, &style)
 }
 
 /// 删掉 OIDC 那一条（还原到「原来没登录」）。删完文件空了、且原来就没有这个文件时删文件。
@@ -231,15 +196,15 @@ pub(crate) fn remove_login(
     pre: Option<&[u8]>,
     delete_if_empty: bool,
 ) -> Result<Option<Vec<u8>>, LiveWriteError> {
-    let Some(content) = pre.filter(|c| !is_blank(c)) else {
+    if pre.is_none() {
         return Ok(None);
-    };
-    let mut root = parse_root(path, content)?;
-    root.remove(&oidc_scope());
+    }
+    let (mut root, style) = parse_root(path, pre)?;
+    root.shift_remove(&oidc_scope());
     if root.is_empty() && delete_if_empty {
         return Ok(None);
     }
-    to_bytes(path, root).map(Some)
+    to_bytes(path, root, &style).map(Some)
 }
 
 /// OIDC 那一条的完整内容（暂存时用）
@@ -247,10 +212,8 @@ pub(crate) fn read_live_entry(
     path: &Path,
     content: Option<&[u8]>,
 ) -> Result<Option<Map<String, Value>>, LiveWriteError> {
-    let Some(content) = content.filter(|c| !is_blank(c)) else {
-        return Ok(None);
-    };
     Ok(parse_root(path, content)?
+        .0
         .get(&oidc_scope())
         .and_then(Value::as_object)
         .cloned())
@@ -275,17 +238,10 @@ pub(crate) struct GrokLoginStash {
 impl GrokLoginStash {
     /// 按 live 现在的内容建暂存
     pub(crate) fn capture(entry: Option<Map<String, Value>>, file_existed: bool) -> Self {
-        let user_id = entry.as_ref().and_then(|entry| {
-            entry
-                .get("user_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-        });
+        let user_id = entry.as_ref().and_then(|entry| non_empty(entry, "user_id"));
         let entry = entry.filter(|_| user_id.is_some()).map(|mut entry| {
             for field in SECRET_FIELDS {
-                entry.remove(field);
+                entry.shift_remove(field);
             }
             entry
         });
@@ -294,6 +250,19 @@ impl GrokLoginStash {
             user_id,
             entry,
             file_existed,
+        }
+    }
+
+    /// 还原成暂存里原来的登录：`login` 是原来那个号的新登录，`None` 表示还原到没登录
+    pub(crate) fn restore_write(&self, login: Option<GrokCliLogin>) -> LoginWrite {
+        match login {
+            Some(login) => LoginWrite::Set {
+                login: Box::new(login),
+                base: self.entry.clone(),
+            },
+            None => LoginWrite::Remove {
+                delete_if_empty: !self.file_existed,
+            },
         }
     }
 
@@ -338,18 +307,6 @@ pub(crate) struct GrokAuthPatch {
     pub expected: Option<LiveLogin>,
 }
 
-impl GrokAuthPatch {
-    pub(crate) fn set(login: GrokCliLogin, expected: Option<LiveLogin>) -> Self {
-        Self {
-            write: LoginWrite::Set {
-                login: Box::new(login),
-                base: None,
-            },
-            expected,
-        }
-    }
-}
-
 impl LivePatch for GrokAuthPatch {
     fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, LiveWriteError> {
         Ok(self.apply_file(path, pre)?.unwrap_or_default())
@@ -367,7 +324,7 @@ impl LivePatch for GrokAuthPatch {
         }
         match &self.write {
             LoginWrite::Set { login, base } => {
-                merge_login_with_base(path, pre, login, base.as_ref(), Utc::now()).map(Some)
+                merge_login(path, pre, login, base.as_ref()).map(Some)
             }
             LoginWrite::Remove { delete_if_empty } => remove_login(path, pre, *delete_if_empty),
         }
@@ -385,11 +342,7 @@ pub(crate) fn write_now(patch: &GrokAuthPatch) -> Result<(), String> {
         Some(bytes) => {
             crate::config::atomic_write_private(&path, &bytes).map_err(|e| e.to_string())
         }
-        None => match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.to_string()),
-        },
+        None => crate::config::delete_file(&path).map_err(|e| e.to_string()),
     }
 }
 
@@ -410,7 +363,7 @@ pub(crate) fn sync_after_refresh(
     if !shares_session {
         return Ok(false);
     }
-    let bytes = merge_login(&path, pre.as_deref(), login, Utc::now()).map_err(|e| e.to_string())?;
+    let bytes = merge_login(&path, pre.as_deref(), login, None).map_err(|e| e.to_string())?;
     crate::config::atomic_write_private(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -443,7 +396,7 @@ mod tests {
 
     #[test]
     fn writes_fresh_file_with_cli_shape() {
-        let out = merge_login(&path(), None, &login("u1", "rt1"), Utc::now()).unwrap();
+        let out = merge_login(&path(), None, &login("u1", "rt1"), None).unwrap();
         let e = entry(&out);
         assert_eq!(e["key"], "at-u1");
         assert_eq!(e["user_id"], "u1");
@@ -461,13 +414,7 @@ mod tests {
             (oidc_scope()): {"user_id": "u1", "first_name": "Ann", "key": "old", "refresh_token": "rt0"}
         })
         .to_string();
-        let out = merge_login(
-            &path(),
-            Some(pre.as_bytes()),
-            &login("u1", "rt1"),
-            Utc::now(),
-        )
-        .unwrap();
+        let out = merge_login(&path(), Some(pre.as_bytes()), &login("u1", "rt1"), None).unwrap();
         let e = entry(&out);
         assert_eq!(e["first_name"], "Ann");
         assert_eq!(e["key"], "at-u1");
@@ -481,13 +428,7 @@ mod tests {
             (oidc_scope()): {"user_id": "u2", "first_name": "Bob", "key": "old"}
         })
         .to_string();
-        let out = merge_login(
-            &path(),
-            Some(pre.as_bytes()),
-            &login("u1", "rt1"),
-            Utc::now(),
-        )
-        .unwrap();
+        let out = merge_login(&path(), Some(pre.as_bytes()), &login("u1", "rt1"), None).unwrap();
         let e = entry(&out);
         assert!(!e.contains_key("first_name"));
         assert_eq!(e["user_id"], "u1");
@@ -518,27 +459,24 @@ mod tests {
             (oidc_scope()): {"user_id": "u2", "refresh_token": "rotated"}
         })
         .to_string();
-        let patch = GrokAuthPatch::set(
-            login("u1", "rt1"),
-            Some(LiveLogin {
+        let patch = |seen: &str| GrokAuthPatch {
+            write: LoginWrite::Set {
+                login: Box::new(login("u1", "rt1")),
+                base: None,
+            },
+            expected: Some(LiveLogin {
                 user_id: "u2".to_string(),
                 email: None,
-                refresh_token: Some("before".to_string()),
+                refresh_token: Some(seen.to_string()),
             }),
-        );
+        };
         assert!(matches!(
-            patch.apply(&path(), Some(pre.as_bytes())),
+            patch("before").apply(&path(), Some(pre.as_bytes())),
             Err(LiveWriteError::Conflict { .. })
         ));
-        let patch = GrokAuthPatch::set(
-            login("u1", "rt1"),
-            Some(LiveLogin {
-                user_id: "u2".to_string(),
-                email: None,
-                refresh_token: Some("rotated".to_string()),
-            }),
-        );
-        assert!(patch.apply(&path(), Some(pre.as_bytes())).is_ok());
+        assert!(patch("rotated")
+            .apply(&path(), Some(pre.as_bytes()))
+            .is_ok());
     }
 
     #[test]

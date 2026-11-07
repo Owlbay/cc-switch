@@ -218,7 +218,7 @@ pub(crate) fn write_live(
     let pointer = key_fields
         .filter(|_| set_pointer)
         .map(|(_, target)| target.id.clone());
-    grok_direct::run_with_edits(
+    grok_direct::run(
         db,
         if pointer.is_some() {
             op::SWITCH
@@ -229,6 +229,7 @@ pub(crate) fn write_live(
         projection.as_ref(),
         PendingTarget::pointer(pointer),
         Some(edits),
+        None,
     )?;
     Ok(())
 }

@@ -487,6 +487,8 @@ async fn write_proxy(
                 live_now.direct_owner(),
                 (!unchanged).then_some(&projection),
                 pending(target),
+                None,
+                None,
             )
             .map_err(err)?;
             unchanged
@@ -604,12 +606,14 @@ fn write_direct(
             let login = usable_direct(app, direct.as_ref())
                 .filter(|_| attached && op_name == op::EXIT)
                 .and_then(|provider| {
-                    grok_direct::prepare_login(provider).unwrap_or_else(|error| {
-                        log::warn!("退出路由时换 Grok CLI 登录失败，只写回配置: {error}");
-                        None
-                    })
+                    grok_direct::prepare_login(&state.xai_oauth_manager, provider).unwrap_or_else(
+                        |error| {
+                            log::warn!("退出路由时换 Grok CLI 登录失败，只写回配置: {error}");
+                            None
+                        },
+                    )
                 });
-            grok_direct::run_all(
+            grok_direct::run(
                 &state.db,
                 op_name,
                 None,

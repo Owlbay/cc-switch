@@ -195,20 +195,6 @@ pub struct XaiOAuthStatus {
     pub username: Option<String>,
 }
 
-static SHARED_MANAGER: std::sync::RwLock<Option<Arc<RwLock<XaiOAuthManager>>>> =
-    std::sync::RwLock::new(None);
-
-/// 登记应用里那个 xAI 账号管理器，供拿不到 tauri State 的同步路径（切 Grok 官方卡）使用。
-pub(crate) fn register_shared_manager(manager: Arc<RwLock<XaiOAuthManager>>) {
-    if let Ok(mut slot) = SHARED_MANAGER.write() {
-        *slot = Some(manager);
-    }
-}
-
-pub(crate) fn shared_manager() -> Option<Arc<RwLock<XaiOAuthManager>>> {
-    SHARED_MANAGER.read().ok().and_then(|slot| slot.clone())
-}
-
 pub struct XaiOAuthManager {
     accounts: Arc<RwLock<HashMap<String, XaiAccountData>>>,
     default_account_id: Arc<RwLock<Option<String>>>,
@@ -499,39 +485,17 @@ impl XaiOAuthManager {
             expires_at_ms: compute_expires_at_ms(tokens.expires_in),
         };
 
-        {
-            let _mutation_guard = self.mutation_lock.lock().await;
-            let mut accounts = self.accounts.read().await.clone();
-            match accounts.get_mut(account_id) {
-                Some(account) => {
-                    account.refresh_token = new_refresh.clone();
-                    account.requires_reauth = false;
-                }
-                None => {
-                    accounts.insert(
-                        account_id.to_string(),
-                        XaiAccountData {
-                            account_id: account_id.to_string(),
-                            login: live.email.clone(),
-                            refresh_token: new_refresh.clone(),
-                            authenticated_at: chrono::Utc::now().timestamp(),
-                            requires_reauth: false,
-                        },
-                    );
-                }
-            }
-            let current_default = self.default_account_id.read().await.clone();
-            let default_account_id = match current_default {
-                Some(id) if Self::is_usable_account(&accounts, &id) => Some(id),
-                _ => Some(account_id.to_string()),
-            };
-            self.persist_and_commit(accounts, default_account_id)
-                .await?;
-            self.access_tokens
-                .write()
-                .await
-                .insert(account_id.to_string(), cached.clone());
-        }
+        let login = existing
+            .and_then(|account| account.login)
+            .or_else(|| live.email.clone());
+        self.add_account_internal(
+            account_id.to_string(),
+            login,
+            new_refresh.clone(),
+            None,
+            Some(cached.clone()),
+        )
+        .await?;
 
         if new_refresh != cli_refresh {
             self.sync_grok_cli_after_refresh(account_id, cli_refresh, &cached)
@@ -637,38 +601,30 @@ impl XaiOAuthManager {
         if !removed.contains(&live.user_id) || stash.user_id.as_deref() == Some(&live.user_id) {
             return;
         }
-        let sign_out = crate::grok_auth::LoginWrite::Remove {
-            delete_if_empty: !stash.file_existed,
-        };
-        let write = match stash
+        let login = match stash
             .user_id
             .as_deref()
             .filter(|user| !removed.iter().any(|id| id == user))
         {
-            Some(original) => match self.grok_cli_login(original).await {
-                Ok(login) => crate::grok_auth::LoginWrite::Set {
-                    login: Box::new(login),
-                    base: stash.entry.clone(),
-                },
-                Err(err) => {
+            Some(original) => self
+                .grok_cli_login(original)
+                .await
+                .inspect_err(|err| {
                     log::warn!(
                         "[XaiOAuth] 还原 Grok CLI 原来的登录失败，改为退出登录（account={original}）: {err}"
-                    );
-                    sign_out
-                }
-            },
-            None => sign_out,
+                    )
+                })
+                .ok(),
+            None => None,
         };
         let patch = crate::grok_auth::GrokAuthPatch {
-            write,
+            write: stash.restore_write(login),
             expected: Some(live),
         };
         match crate::grok_auth::write_now(&patch) {
             Ok(()) => {
-                if let Err(err) = std::fs::remove_file(crate::grok_auth::stash_path()) {
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        log::warn!("[XaiOAuth] 删除 Grok 登录暂存失败: {err}");
-                    }
+                if let Err(err) = crate::config::delete_file(&crate::grok_auth::stash_path()) {
+                    log::warn!("[XaiOAuth] 删除 Grok 登录暂存失败: {err}");
                 }
                 log::info!("[XaiOAuth] 删除账号后已还原 Grok CLI 的登录");
             }

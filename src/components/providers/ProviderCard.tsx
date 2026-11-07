@@ -269,10 +269,20 @@ export function ProviderCard({
       ? resolveManagedAccountId(provider.meta, "claude_official")?.trim() ||
         null
       : null;
-  // 绑了账号的官方卡（Codex / Claude）默认查额度，和 Kimi、agy 的账号卡一样
+  // Grok 官方卡绑了授权中心的 xAI 账号：额度按这个号查，和 xai_oauth 卡同一份缓存
+  const grokBoundAccountId =
+    appId === "grokbuild" && isOfficial
+      ? resolveManagedAccountId(
+          provider.meta,
+          PROVIDER_TYPES.XAI_OAUTH,
+        )?.trim() || null
+      : null;
+  // 绑了账号的官方卡（Codex / Claude / Grok）默认查额度，和 Kimi、agy 的账号卡一样（同托盘）
   const usageEnabled =
     provider.meta?.usage_script?.enabled ??
-    (isBoundCodexOfficial || Boolean(claudeBoundAccountId));
+    (isBoundCodexOfficial ||
+      Boolean(claudeBoundAccountId) ||
+      Boolean(grokBoundAccountId));
   const supportsOfficialSubscription =
     isOfficial &&
     ["claude", "codex", "gemini", "grokbuild", "agy"].includes(appId);
@@ -306,14 +316,6 @@ export function ProviderCard({
       ? isBoundCodexOfficial
       : provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH;
   // xAI OAuth (SuperGrok 反代)：额度经自管 OAuth token 自动显示，与 codex_oauth 同构
-  // Grok 官方卡绑了授权中心的 xAI 账号：额度按这个号查，和 xai_oauth 卡同一份缓存
-  const grokBoundAccountId =
-    appId === "grokbuild" && isOfficial
-      ? resolveManagedAccountId(
-          provider.meta,
-          PROVIDER_TYPES.XAI_OAUTH,
-        )?.trim() || null
-      : null;
   const isXaiOauth =
     provider.meta?.providerType === PROVIDER_TYPES.XAI_OAUTH ||
     Boolean(grokBoundAccountId);
@@ -617,11 +619,13 @@ export function ProviderCard({
                   />
                 ) : null
               ) : isXaiOauth ? (
-                <XaiOauthQuotaFooter
-                  meta={provider.meta}
-                  inline={true}
-                  isCurrent={isCurrent}
-                />
+                !grokBoundAccountId || usageEnabled ? (
+                  <XaiOauthQuotaFooter
+                    meta={provider.meta}
+                    inline={true}
+                    isCurrent={isCurrent}
+                  />
+                ) : null
               ) : appId === "kimi" && isOfficial ? (
                 // 每张 Kimi 官方卡就是授权中心里的一个账号，额度按卡上那个号查
                 <KimiAccountQuotaFooter

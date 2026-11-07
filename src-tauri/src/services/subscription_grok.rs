@@ -162,27 +162,6 @@ fn select_preferred_entry(
     oidc_candidate.or(legacy_candidate)
 }
 
-/// Grok CLI 当前登录账号的 xAI 用户 id（auth.json 首选条目的 `user_id`）。
-///
-/// 与 cc-switch 自管 xAI OAuth 账号的 id（id_token 的 `sub`）同源，
-/// 用于在 Grok CLI 令牌过期时找到授权中心里的同一个账号兜底查额度。
-pub(crate) fn grok_cli_user_id() -> Option<String> {
-    let auth_path = crate::grok_config::get_grok_config_dir().join("auth.json");
-    let content = std::fs::read_to_string(auth_path).ok()?;
-    grok_user_id_from_auth_json(&content)
-}
-
-fn grok_user_id_from_auth_json(content: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
-    let entry = select_preferred_entry(parsed.as_object()?)?;
-    entry
-        .get("user_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-}
-
 /// 判断 ISO 8601 时间串是否已过期；无法解析时不视为过期
 fn is_iso_expired(iso: &str) -> bool {
     let now_secs = SystemTime::now()
@@ -823,23 +802,6 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn grok_user_id_comes_from_preferred_entry() {
-        let json = r#"{
-            "https://accounts.x.ai/sign-in": {"key": "legacy", "user_id": "legacy-user"},
-            "https://auth.x.ai::client": {"key": "oidc", "user_id": " user-123 "}
-        }"#;
-        assert_eq!(
-            grok_user_id_from_auth_json(json).as_deref(),
-            Some("user-123")
-        );
-        assert_eq!(
-            grok_user_id_from_auth_json(r#"{"https://auth.x.ai::c": {"key": "k"}}"#),
-            None
-        );
-        assert_eq!(grok_user_id_from_auth_json("not json"), None);
-    }
 
     // ── protobuf 构造辅助 ──
 
