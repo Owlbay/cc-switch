@@ -8,11 +8,12 @@
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
-use crate::grok_auth::GrokAuthPatch;
+use crate::grok_auth::{GrokAuthPatch, GrokLoginStash, LiveLogin, LoginWrite};
 use crate::grok_config::get_grok_config_path;
 
-use crate::live::engine::{DeviceStore, LiveFile};
+use crate::live::engine::{read_current, DeviceStore, LiveFile};
 use crate::live::patch::toml::{TomlDocPatch, TomlSteps};
+use crate::live::patch::WholeFile;
 use crate::live::project::claude::PROXY_TOKEN_PLACEHOLDER;
 use crate::live::project::grok::{GrokConfigPatch, GrokProjection};
 use crate::mode::operation::{AppWrite, FileChange, OperationReport};
@@ -48,50 +49,162 @@ pub(crate) fn bound_account(provider: &Provider) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-/// 写 Grok CLI 登录要用的东西，在拿写锁之前备好（可能联网刷新令牌）。
+/// 切换时 Grok CLI 登录（`auth.json`）和登录暂存要做的改动，在拿写锁之前备好。
+pub(crate) struct LoginChange {
+    pub auth: Option<GrokAuthPatch>,
+    /// 登录暂存：第一次覆盖 Grok CLI 自己的登录时写入，还原后删除
+    pub stash: Option<WholeFile>,
+}
+
+/// 备好切到 `target` 时 Grok CLI 登录的改动（可能联网刷新令牌）。
 ///
-/// - 卡没绑账号、或 Grok CLI 现在登录的就是这个号：不写登录，返回 `None`；
-/// - 要换号时先把 CLI 现在的登录收进授权中心（它可能轮换过 refresh token，或者是没在
-///   授权中心的号），免得被覆盖后丢掉；再取目标账号的登录。
-pub(crate) fn prepare_login(target: &Provider) -> Result<Option<GrokAuthPatch>, AppError> {
-    let Some(account_id) = bound_account(target) else {
+/// - 绑了账号的官方卡：Grok CLI 登录的已是这个号就不动；否则先把 CLI 现在的登录收进授权
+///   中心（可能轮换过 refresh token，或是没在授权中心的号），第一次覆盖 CLI 自己的登录时记下
+///   原来是谁，再写入目标账号。出错就不切换，免得丢掉登录。
+/// - 没绑账号的官方卡（跟随 Grok CLI 登录）：有暂存就还原原来的登录并删掉暂存；还原不了
+///   只记日志，登录保持现状。
+/// - 第三方卡：不动登录。
+pub(crate) fn prepare_login(target: &Provider) -> Result<Option<LoginChange>, AppError> {
+    if !is_official(target) {
         return Ok(None);
-    };
-    let live = crate::grok_auth::read_live_login_from_disk();
+    }
+    match bound_account(target) {
+        Some(account_id) => prepare_bound(account_id),
+        None => Ok(prepare_restore().unwrap_or_else(|error| {
+            log::warn!("还原 Grok CLI 原来的登录失败，登录保持现状: {error}");
+            None
+        })),
+    }
+}
+
+fn manager_unavailable() -> AppError {
+    AppError::Message("xAI 账号管理器尚未初始化，无法切换 Grok 登录".to_string())
+}
+
+/// 在独立线程里跑要用账号管理器的异步步骤（调用方可能已在 tokio 运行时里）
+fn with_manager<T, F, Fut>(f: F) -> Result<T, AppError>
+where
+    T: Send + 'static,
+    F: FnOnce(XaiManager) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+{
+    let manager = crate::proxy::providers::xai_oauth_auth::shared_manager()
+        .ok_or_else(manager_unavailable)?;
+    std::thread::spawn(move || tauri::async_runtime::block_on(f(manager)))
+        .join()
+        .map_err(|_| AppError::Message("Grok 登录准备线程异常退出".to_string()))?
+}
+
+type XaiManager =
+    std::sync::Arc<tokio::sync::RwLock<crate::proxy::providers::xai_oauth_auth::XaiOAuthManager>>;
+
+/// 把 Grok CLI 现在的登录收进授权中心，再取 `account_id` 的登录
+async fn absorb_then_login(
+    manager: &XaiManager,
+    live: Option<&LiveLogin>,
+    account_id: &str,
+) -> Result<crate::grok_auth::GrokCliLogin, AppError> {
+    let manager = manager.read().await;
+    if let Some(live) = live {
+        manager.absorb_grok_cli_login(live).await.map_err(|e| {
+            AppError::localized(
+                "grokbuild.login.absorb_failed",
+                format!("无法确认 Grok CLI 现在的登录，为避免丢掉它，本次没有切换：{e}"),
+                format!(
+                    "Could not verify Grok CLI's current login, so nothing was switched to avoid losing it: {e}"
+                ),
+            )
+        })?;
+    }
+    manager.grok_cli_login(account_id).await.map_err(|e| {
+        AppError::localized(
+            "grokbuild.login.account_unavailable",
+            format!("授权中心的 xAI 账号不可用，请在授权中心重新登录：{e}"),
+            format!("The xAI account in the auth center is unavailable; sign in again there: {e}"),
+        )
+    })
+}
+
+fn prepare_bound(account_id: String) -> Result<Option<LoginChange>, AppError> {
+    let path = crate::grok_auth::auth_path();
+    let pre = read_current(&path)?;
+    let live = crate::grok_auth::read_live_login(&path, pre.as_deref())?;
     if live.as_ref().is_some_and(|live| live.user_id == account_id) {
         return Ok(None);
     }
-    let manager = crate::proxy::providers::xai_oauth_auth::shared_manager().ok_or_else(|| {
-        AppError::Message("xAI 账号管理器尚未初始化，无法切换 Grok 登录".to_string())
+    // 还没有暂存：live 里是 Grok CLI 自己的登录，记下来以便切回时还原
+    let stash = match crate::grok_auth::read_stash().map_err(AppError::Message)? {
+        Some(_) => None,
+        None => Some(WholeFile::Write(
+            GrokLoginStash::capture(
+                crate::grok_auth::read_live_entry(&path, pre.as_deref())?,
+                pre.is_some(),
+            )
+            .to_bytes(),
+        )),
+    };
+    let login = with_manager(move |manager| async move {
+        absorb_then_login(&manager, live.as_ref(), &account_id).await
     })?;
-    std::thread::spawn(move || {
-        tauri::async_runtime::block_on(async move {
-            let manager = manager.read().await;
-            if let Some(live) = &live {
-                manager.absorb_grok_cli_login(live).await.map_err(|e| {
-                    AppError::localized(
-                        "grokbuild.login.absorb_failed",
-                        format!("无法确认 Grok CLI 现在的登录，为避免丢掉它，本次没有切换：{e}"),
-                        format!(
-                            "Could not verify Grok CLI's current login, so nothing was switched to avoid losing it: {e}"
-                        ),
-                    )
+    // 收进授权中心时可能刚把新令牌写回 CLI：按现在的盘面做发布前的比对
+    let expected = crate::grok_auth::read_live_login_from_disk();
+    Ok(Some(LoginChange {
+        auth: Some(GrokAuthPatch::set(login, expected)),
+        stash,
+    }))
+}
+
+fn prepare_restore() -> Result<Option<LoginChange>, AppError> {
+    let Some(stash) = crate::grok_auth::read_stash().map_err(AppError::Message)? else {
+        return Ok(None);
+    };
+    let path = crate::grok_auth::auth_path();
+    let pre = read_current(&path)?;
+    let live = crate::grok_auth::read_live_login(&path, pre.as_deref())?;
+    let drop_stash = Some(WholeFile::Delete);
+    let write = match stash.user_id.clone() {
+        // 已经是原来的号（比如用户自己又 `grok login` 了）：只删暂存
+        Some(user_id) if live.as_ref().is_some_and(|live| live.user_id == user_id) => {
+            return Ok(Some(LoginChange {
+                auth: None,
+                stash: drop_stash,
+            }));
+        }
+        Some(user_id) => {
+            let live_for_absorb = live.clone();
+            let login = with_manager(move |manager| async move {
+                absorb_then_login(&manager, live_for_absorb.as_ref(), &user_id).await
+            })?;
+            LoginWrite::Set {
+                login: Box::new(login),
+                base: stash.entry.clone(),
+            }
+        }
+        None => {
+            if let Some(live) = live.clone() {
+                // 要删掉的是托管账号的登录：CLI 可能轮换过令牌，先收进授权中心
+                with_manager(move |manager| async move {
+                    manager
+                        .read()
+                        .await
+                        .absorb_grok_cli_login(&live)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| AppError::Message(e.to_string()))
                 })?;
             }
-            let login = manager.grok_cli_login(&account_id).await.map_err(|e| {
-                AppError::localized(
-                    "grokbuild.login.account_unavailable",
-                    format!("授权中心的 xAI 账号不可用，请在授权中心重新登录：{e}"),
-                    format!("The xAI account in the auth center is unavailable; sign in again there: {e}"),
-                )
-            })?;
-            // 收进授权中心时可能刚把新令牌写回 CLI：按现在的盘面做发布前的比对
-            let expected = crate::grok_auth::read_live_login_from_disk();
-            Ok(Some(GrokAuthPatch { login, expected }))
-        })
-    })
-    .join()
-    .map_err(|_| AppError::Message("Grok 登录准备线程异常退出".to_string()))?
+            LoginWrite::Remove {
+                delete_if_empty: !stash.file_existed,
+            }
+        }
+    };
+    Ok(Some(LoginChange {
+        auth: Some(GrokAuthPatch {
+            write,
+            expected: crate::grok_auth::read_live_login_from_disk(),
+        }),
+        stash: drop_stash,
+    }))
 }
 
 /// 供应商要写的模型表。写之前校验，校验不过什么都不写。
@@ -196,15 +309,15 @@ pub(crate) fn run_with_edits(
     run_all(db, op, live_owner, projection, target, edits, None)
 }
 
-/// 同 [`run_with_edits`]，另把绑定账号的登录写进 `auth.json`（和 `config.toml` 同一个操作）。
-fn run_all(
+/// 同 [`run_with_edits`]，另把 Grok CLI 登录和登录暂存的改动在同一个操作里写进去。
+pub(crate) fn run_all(
     db: &Database,
     op: &str,
     live_owner: Option<&Provider>,
     projection: Option<&GrokProjection>,
     mut target: PendingTarget,
     edits: Option<&TomlEdits>,
-    login: Option<&GrokAuthPatch>,
+    login: Option<&LoginChange>,
 ) -> Result<OperationReport, AppError> {
     // 先补完上一次没做完的操作：它可能改了写入记录和指针，下面要按最新的记录删表。
     let app_write = AppWrite::begin(db, app())?;
@@ -239,10 +352,16 @@ fn run_all(
         })
         .into_iter()
         .collect();
-    if let Some(login) = login {
+    if let Some(auth) = login.and_then(|login| login.auth.as_ref()) {
         changes.push(FileChange {
             file: LiveFile::private(crate::grok_auth::auth_path()),
-            patch: login,
+            patch: auth,
+        });
+    }
+    if let Some(stash) = login.and_then(|login| login.stash.as_ref()) {
+        changes.push(FileChange {
+            file: LiveFile::private(app_write.store.file(crate::grok_auth::STASH_FILENAME)),
+            patch: stash,
         });
     }
     app_write.run(op, &changes, target)

@@ -268,7 +268,7 @@
         "defaultDescription": "账号会随 Grok CLI 当前登录变化",
         "missing": "不在这台电脑上的账号",
         "manage": "添加或管理 xAI 账号",
-        "help": "切到这张卡后，Grok CLI 的登录（~/.grok/auth.json）会换成选中的账号；原来登录的号会先收进授权中心，不会丢。",
+        "help": "切到这张卡后，Grok CLI 的登录（~/.grok/auth.json）会换成选中的账号；原来登录的号会先收进授权中心，切回「跟随 Grok CLI 登录」的卡时还原。",
         "xaiAccount": "xAI 账号",
         "reauthBadge": "需要重新登录"
       }

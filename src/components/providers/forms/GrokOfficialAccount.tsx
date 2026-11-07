@@ -172,7 +172,7 @@ export function GrokAccountSelect({
       <p className="text-caption text-fg-2">
         {t("provider.form.grokAccount.help", {
           defaultValue:
-            "切到这张卡后，Grok CLI 的登录（~/.grok/auth.json）会换成选中的账号；原来登录的号会先收进授权中心，不会丢。",
+            "切到这张卡后，Grok CLI 的登录（~/.grok/auth.json）会换成选中的账号；原来登录的号会先收进授权中心，切回「跟随 Grok CLI 登录」的卡时还原。",
         })}
       </p>
     </div>

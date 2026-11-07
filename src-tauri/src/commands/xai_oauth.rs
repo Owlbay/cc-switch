@@ -124,10 +124,28 @@ pub(crate) async fn query_grokbuild_quota_with_managed_fallback(
 /// 查询 xAI OAuth (SuperGrok 反代) 订阅额度
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_xai_oauth_quota(
+    app: tauri::AppHandle,
+    app_state: State<'_, crate::store::AppState>,
     account_id: Option<String>,
     state: State<'_, XaiOAuthState>,
 ) -> Result<SubscriptionQuota, String> {
-    query_xai_oauth_quota_for(&state, account_id, true).await
+    // 先定下账号，查到的结果按账号存进托盘缓存（绑了账号的 Grok 官方卡在托盘上读它）
+    let resolved = match account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => Some(id.to_string()),
+        None => state.0.read().await.default_account_id().await,
+    };
+    let quota = query_xai_oauth_quota_for(&state, resolved.clone(), true).await?;
+    if let Some(account_id) = resolved {
+        app_state
+            .usage_cache
+            .put_xai_account(account_id, quota.clone());
+        crate::tray::schedule_tray_refresh(&app);
+    }
+    Ok(quota)
 }
 
 #[derive(Debug, Deserialize)]

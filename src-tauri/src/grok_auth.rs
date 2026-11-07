@@ -8,6 +8,11 @@
 //!   （[`sync_after_refresh`]），否则 CLI 下次刷新会被拒、掉登录。
 //!
 //! 只动这一条，文件里的其他条目（旧版 session 登录等）原样保留。
+//!
+//! **登录暂存。**第一次用托管账号覆盖 Grok CLI 自己的登录时，记下原来是谁
+//! （`~/.cc-switch/grok-login-stash.json`，0600，不同步；不存令牌，那个号已经收进授权
+//! 中心）。切回「跟随 Grok CLI 登录」的官方卡时按它还原，原来没登录就删掉这一条；还原后
+//! 删掉暂存。授权中心删掉一个号、而 live 里是 CC Switch 替它写的登录时，也按暂存还原。
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +20,12 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
 use crate::live::patch::{LivePatch, LiveWriteError};
+
+/// 登录暂存文件名（在 CC Switch 的设备目录 `~/.cc-switch` 下）
+pub(crate) const STASH_FILENAME: &str = "grok-login-stash.json";
+
+/// 写进暂存的条目里不留令牌：还原时从授权中心取新的
+const SECRET_FIELDS: [&str; 2] = ["key", "refresh_token"];
 
 pub(crate) const OIDC_ISSUER: &str = "https://auth.x.ai";
 
@@ -130,17 +141,31 @@ pub(crate) fn merge_login(
     login: &GrokCliLogin,
     now: DateTime<Utc>,
 ) -> Result<Vec<u8>, LiveWriteError> {
+    merge_login_with_base(path, pre, login, None, now)
+}
+
+/// 同 [`merge_login`]；live 里不是这个用户时以 `base`（还原时暂存的原条目，不含令牌）为底，
+/// 把 CLI 原来写的名字、头像等资料带回去。
+pub(crate) fn merge_login_with_base(
+    path: &Path,
+    pre: Option<&[u8]>,
+    login: &GrokCliLogin,
+    base: Option<&Map<String, Value>>,
+    now: DateTime<Utc>,
+) -> Result<Vec<u8>, LiveWriteError> {
     let mut root = match pre.filter(|c| !is_blank(c)) {
         Some(content) => parse_root(path, content)?,
         None => Map::new(),
     };
     let scope = oidc_scope();
+    let same_user = |entry: &&Map<String, Value>| {
+        entry.get("user_id").and_then(Value::as_str) == Some(login.account_id.as_str())
+    };
     let mut entry = root
         .get(&scope)
         .and_then(Value::as_object)
-        .filter(|existing| {
-            existing.get("user_id").and_then(Value::as_str) == Some(login.account_id.as_str())
-        })
+        .filter(same_user)
+        .or(base.filter(same_user))
         .cloned()
         .unwrap_or_default();
 
@@ -187,6 +212,10 @@ pub(crate) fn merge_login(
     );
 
     root.insert(scope, Value::Object(entry));
+    to_bytes(path, root)
+}
+
+fn to_bytes(path: &Path, root: Map<String, Value>) -> Result<Vec<u8>, LiveWriteError> {
     let mut bytes =
         serde_json::to_vec_pretty(&Value::Object(root)).map_err(|e| LiveWriteError::Io {
             path: path.to_path_buf(),
@@ -196,21 +225,171 @@ pub(crate) fn merge_login(
     Ok(bytes)
 }
 
-/// 切到绑了账号的官方卡时写 `auth.json` 的补丁。`expected` 是准备阶段看到的 OIDC 登录：
-/// 发布前 Grok CLI 又刷新过（refresh token 变了），就拒绝写，免得把刚轮换出来的令牌覆盖掉。
+/// 删掉 OIDC 那一条（还原到「原来没登录」）。删完文件空了、且原来就没有这个文件时删文件。
+pub(crate) fn remove_login(
+    path: &Path,
+    pre: Option<&[u8]>,
+    delete_if_empty: bool,
+) -> Result<Option<Vec<u8>>, LiveWriteError> {
+    let Some(content) = pre.filter(|c| !is_blank(c)) else {
+        return Ok(None);
+    };
+    let mut root = parse_root(path, content)?;
+    root.remove(&oidc_scope());
+    if root.is_empty() && delete_if_empty {
+        return Ok(None);
+    }
+    to_bytes(path, root).map(Some)
+}
+
+/// OIDC 那一条的完整内容（暂存时用）
+pub(crate) fn read_live_entry(
+    path: &Path,
+    content: Option<&[u8]>,
+) -> Result<Option<Map<String, Value>>, LiveWriteError> {
+    let Some(content) = content.filter(|c| !is_blank(c)) else {
+        return Ok(None);
+    };
+    Ok(parse_root(path, content)?
+        .get(&oidc_scope())
+        .and_then(Value::as_object)
+        .cloned())
+}
+
+/// 第一次被 CC Switch 覆盖前，Grok CLI 自己的登录是谁
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GrokLoginStash {
+    #[serde(default)]
+    pub version: u32,
+    /// 原来登录的用户；`None` 表示原来没登录
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 原来那一条（去掉了令牌），还原时把名字、头像等资料带回去
+    #[serde(default)]
+    pub entry: Option<Map<String, Value>>,
+    /// 原来有没有 `auth.json`：没有的话还原成「没登录」时连文件一起删
+    #[serde(default)]
+    pub file_existed: bool,
+}
+
+impl GrokLoginStash {
+    /// 按 live 现在的内容建暂存
+    pub(crate) fn capture(entry: Option<Map<String, Value>>, file_existed: bool) -> Self {
+        let user_id = entry.as_ref().and_then(|entry| {
+            entry
+                .get("user_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
+        let entry = entry.filter(|_| user_id.is_some()).map(|mut entry| {
+            for field in SECRET_FIELDS {
+                entry.remove(field);
+            }
+            entry
+        });
+        Self {
+            version: 1,
+            user_id,
+            entry,
+            file_existed,
+        }
+    }
+
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(self).unwrap_or_default();
+        bytes.push(b'\n');
+        bytes
+    }
+}
+
+pub(crate) fn stash_path() -> PathBuf {
+    crate::live::engine::DeviceStore::for_device().file(STASH_FILENAME)
+}
+
+/// 读登录暂存。`Ok(None)`：没有暂存；`Err`：文件在但读不了（不能当成没有，免得覆盖掉）。
+pub(crate) fn read_stash() -> Result<Option<GrokLoginStash>, String> {
+    let path = stash_path();
+    let Some(bytes) = crate::live::engine::read_current(&path).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("Grok 登录暂存 {} 无法解析: {e}", path.display()))
+}
+
+/// `auth.json` 里 OIDC 那一条要换成什么
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LoginWrite {
+    /// 换成这个账号的登录；`base` 是还原时暂存的原条目
+    Set {
+        login: Box<GrokCliLogin>,
+        base: Option<Map<String, Value>>,
+    },
+    /// 删掉这一条（还原到原来没登录）
+    Remove { delete_if_empty: bool },
+}
+
+/// 写 `auth.json` 的补丁。`expected` 是准备阶段看到的 OIDC 登录：发布前 Grok CLI 又刷新过
+/// （refresh token 变了），就拒绝写，免得把刚轮换出来的令牌覆盖掉。
 pub(crate) struct GrokAuthPatch {
-    pub login: GrokCliLogin,
+    pub write: LoginWrite,
     pub expected: Option<LiveLogin>,
+}
+
+impl GrokAuthPatch {
+    pub(crate) fn set(login: GrokCliLogin, expected: Option<LiveLogin>) -> Self {
+        Self {
+            write: LoginWrite::Set {
+                login: Box::new(login),
+                base: None,
+            },
+            expected,
+        }
+    }
 }
 
 impl LivePatch for GrokAuthPatch {
     fn apply(&self, path: &Path, pre: Option<&[u8]>) -> Result<Vec<u8>, LiveWriteError> {
+        Ok(self.apply_file(path, pre)?.unwrap_or_default())
+    }
+
+    fn apply_file(
+        &self,
+        path: &Path,
+        pre: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, LiveWriteError> {
         if read_live_login(path, pre)? != self.expected {
             return Err(LiveWriteError::Conflict {
                 path: path.to_path_buf(),
             });
         }
-        merge_login(path, pre, &self.login, Utc::now())
+        match &self.write {
+            LoginWrite::Set { login, base } => {
+                merge_login_with_base(path, pre, login, base.as_ref(), Utc::now()).map(Some)
+            }
+            LoginWrite::Remove { delete_if_empty } => remove_login(path, pre, *delete_if_empty),
+        }
+    }
+}
+
+/// 直接写 `auth.json`（不经切换事务：授权中心删号时用），写前按 `expected` 比对。
+pub(crate) fn write_now(patch: &GrokAuthPatch) -> Result<(), String> {
+    let path = auth_path();
+    let pre = crate::live::engine::read_current(&path).map_err(|e| e.to_string())?;
+    match patch
+        .apply_file(&path, pre.as_deref())
+        .map_err(|e| e.to_string())?
+    {
+        Some(bytes) => {
+            crate::config::atomic_write_private(&path, &bytes).map_err(|e| e.to_string())
+        }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        },
     }
 }
 
@@ -339,26 +518,95 @@ mod tests {
             (oidc_scope()): {"user_id": "u2", "refresh_token": "rotated"}
         })
         .to_string();
-        let patch = GrokAuthPatch {
-            login: login("u1", "rt1"),
-            expected: Some(LiveLogin {
+        let patch = GrokAuthPatch::set(
+            login("u1", "rt1"),
+            Some(LiveLogin {
                 user_id: "u2".to_string(),
                 email: None,
                 refresh_token: Some("before".to_string()),
             }),
-        };
+        );
         assert!(matches!(
             patch.apply(&path(), Some(pre.as_bytes())),
             Err(LiveWriteError::Conflict { .. })
         ));
-        let patch = GrokAuthPatch {
-            login: login("u1", "rt1"),
-            expected: Some(LiveLogin {
+        let patch = GrokAuthPatch::set(
+            login("u1", "rt1"),
+            Some(LiveLogin {
                 user_id: "u2".to_string(),
                 email: None,
                 refresh_token: Some("rotated".to_string()),
             }),
-        };
+        );
         assert!(patch.apply(&path(), Some(pre.as_bytes())).is_ok());
+    }
+
+    #[test]
+    fn stash_keeps_identity_and_profile_but_no_tokens() {
+        let entry = serde_json::json!({
+            "user_id": "u2", "first_name": "Bob", "key": "at", "refresh_token": "rt"
+        });
+        let stash = GrokLoginStash::capture(entry.as_object().cloned(), true);
+        assert_eq!(stash.user_id.as_deref(), Some("u2"));
+        let kept = stash.entry.as_ref().unwrap();
+        assert_eq!(kept["first_name"], "Bob");
+        assert!(!kept.contains_key("key") && !kept.contains_key("refresh_token"));
+        assert!(stash.file_existed);
+
+        let none = GrokLoginStash::capture(None, false);
+        assert_eq!(none.user_id, None);
+        assert_eq!(none.entry, None);
+    }
+
+    #[test]
+    fn restore_brings_back_profile_fields_from_the_stash() {
+        let pre = serde_json::json!({
+            (oidc_scope()): {"user_id": "u1", "key": "at-u1", "refresh_token": "rt-u1"}
+        })
+        .to_string();
+        let base = serde_json::json!({"user_id": "u2", "first_name": "Bob"});
+        let patch = GrokAuthPatch {
+            write: LoginWrite::Set {
+                login: Box::new(login("u2", "rt2")),
+                base: base.as_object().cloned(),
+            },
+            expected: read_live_login(&path(), Some(pre.as_bytes())).unwrap(),
+        };
+        let out = patch
+            .apply_file(&path(), Some(pre.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let e = entry(&out);
+        assert_eq!(e["first_name"], "Bob");
+        assert_eq!(e["user_id"], "u2");
+        assert_eq!(e["refresh_token"], "rt2");
+    }
+
+    #[test]
+    fn restore_to_signed_out_removes_the_entry_or_the_file() {
+        let only = serde_json::json!({(oidc_scope()): {"user_id": "u1"}}).to_string();
+        assert_eq!(
+            remove_login(&path(), Some(only.as_bytes()), true).unwrap(),
+            None
+        );
+        let kept = remove_login(&path(), Some(only.as_bytes()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&kept).unwrap(),
+            serde_json::json!({})
+        );
+
+        let mixed = serde_json::json!({
+            "https://accounts.x.ai/sign-in": {"key": "legacy"},
+            (oidc_scope()): {"user_id": "u1"}
+        })
+        .to_string();
+        let out = remove_login(&path(), Some(mixed.as_bytes()), true)
+            .unwrap()
+            .unwrap();
+        let root: Value = serde_json::from_slice(&out).unwrap();
+        assert!(root.get(oidc_scope()).is_none());
+        assert_eq!(root["https://accounts.x.ai/sign-in"]["key"], "legacy");
     }
 }

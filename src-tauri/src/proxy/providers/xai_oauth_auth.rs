@@ -613,7 +613,67 @@ impl XaiOAuthManager {
             .await?;
         self.access_tokens.write().await.remove(account_id);
         self.refresh_locks.write().await.remove(account_id);
+        // 还原 Grok CLI 登录时可能要刷新令牌（会再拿这把锁），先放开
+        drop(_mutation_guard);
+        self.release_grok_cli_login(&[account_id.to_string()]).await;
         Ok(())
+    }
+
+    /// 授权中心删掉了这些号：Grok CLI 现在登录的若是 CC Switch 替其中某个号写的（有登录暂存、
+    /// 且不是暂存里原来的号），就按暂存还原原来的登录；原来的号也没了就删掉这一条，不让
+    /// CLI 继续用已删除的号。Grok CLI 自己的登录不碰。失败只记日志。
+    async fn release_grok_cli_login(&self, removed: &[String]) {
+        let stash = match crate::grok_auth::read_stash() {
+            Ok(Some(stash)) => stash,
+            Ok(None) => return,
+            Err(err) => {
+                log::warn!("[XaiOAuth] 删除账号后没有处理 Grok CLI 登录: {err}");
+                return;
+            }
+        };
+        let Some(live) = crate::grok_auth::read_live_login_from_disk() else {
+            return;
+        };
+        if !removed.contains(&live.user_id) || stash.user_id.as_deref() == Some(&live.user_id) {
+            return;
+        }
+        let sign_out = crate::grok_auth::LoginWrite::Remove {
+            delete_if_empty: !stash.file_existed,
+        };
+        let write = match stash
+            .user_id
+            .as_deref()
+            .filter(|user| !removed.iter().any(|id| id == user))
+        {
+            Some(original) => match self.grok_cli_login(original).await {
+                Ok(login) => crate::grok_auth::LoginWrite::Set {
+                    login: Box::new(login),
+                    base: stash.entry.clone(),
+                },
+                Err(err) => {
+                    log::warn!(
+                        "[XaiOAuth] 还原 Grok CLI 原来的登录失败，改为退出登录（account={original}）: {err}"
+                    );
+                    sign_out
+                }
+            },
+            None => sign_out,
+        };
+        let patch = crate::grok_auth::GrokAuthPatch {
+            write,
+            expected: Some(live),
+        };
+        match crate::grok_auth::write_now(&patch) {
+            Ok(()) => {
+                if let Err(err) = std::fs::remove_file(crate::grok_auth::stash_path()) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!("[XaiOAuth] 删除 Grok 登录暂存失败: {err}");
+                    }
+                }
+                log::info!("[XaiOAuth] 删除账号后已还原 Grok CLI 的登录");
+            }
+            Err(err) => log::warn!("[XaiOAuth] 删除账号后处理 Grok CLI 登录失败: {err}"),
+        }
     }
 
     pub async fn set_default_account(&self, account_id: &str) -> Result<(), XaiOAuthError> {
@@ -631,6 +691,7 @@ impl XaiOAuthManager {
 
     pub async fn clear_auth(&self) -> Result<(), XaiOAuthError> {
         let _mutation_guard = self.mutation_lock.lock().await;
+        let removed: Vec<String> = self.accounts.read().await.keys().cloned().collect();
         if self.storage_path.exists() {
             fs::remove_file(&self.storage_path)?;
         }
@@ -639,6 +700,8 @@ impl XaiOAuthManager {
         self.access_tokens.write().await.clear();
         self.refresh_locks.write().await.clear();
         self.pending_device_codes.write().await.clear();
+        drop(_mutation_guard);
+        self.release_grok_cli_login(&removed).await;
         Ok(())
     }
 

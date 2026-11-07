@@ -598,12 +598,25 @@ fn write_direct(
                     GrokProjection { table: None }
                 })
             });
-            grok_direct::run(
+            // 退出路由（不是退出 CC Switch 时的分离）回到直连的官方卡：和切换一样换好 Grok CLI
+            // 的登录（路由期间可能改过直连卡或它绑的号）。登录换不了不能让客户端一直指着
+            // 代理：只写配置，记日志。
+            let login = usable_direct(app, direct.as_ref())
+                .filter(|_| attached && op_name == op::EXIT)
+                .and_then(|provider| {
+                    grok_direct::prepare_login(provider).unwrap_or_else(|error| {
+                        log::warn!("退出路由时换 Grok CLI 登录失败，只写回配置: {error}");
+                        None
+                    })
+                });
+            grok_direct::run_all(
                 &state.db,
                 op_name,
                 None,
                 projection.as_ref(),
                 pending_target,
+                None,
+                login.as_ref(),
             )
             .map_err(err)?;
         }

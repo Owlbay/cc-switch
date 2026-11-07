@@ -3830,3 +3830,143 @@ fn omp_edit_save_keeps_every_byte_outside_the_edited_entry() {
     assert!(after.contains("name: Duolalab"), "{after}");
     assert!(after.ends_with(sibling), "{after}");
 }
+
+const GROK_OIDC_SCOPE: &str = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828";
+
+fn grok_official(id: &str, account: Option<&str>) -> Provider {
+    let mut provider = Provider::with_id(
+        id.to_string(),
+        "Grok Official".to_string(),
+        json!({ "config": "" }),
+        None,
+    );
+    provider.category = Some("official".to_string());
+    if let Some(account) = account {
+        provider.meta = Some(
+            serde_json::from_value(json!({
+                "authBinding": {
+                    "source": "managed_account",
+                    "authProvider": "xai_oauth",
+                    "accountId": account
+                }
+            }))
+            .expect("meta"),
+        );
+    }
+    provider
+}
+
+fn grok_auth_with(user: &str) -> serde_json::Value {
+    json!({ GROK_OIDC_SCOPE: { "user_id": user, "key": "at", "refresh_token": "rt" } })
+}
+
+#[test]
+/// 切回「跟随 Grok CLI 登录」时，CLI 已经是原来的号：只删登录暂存，不动 auth.json。
+fn grok_follow_cli_card_drops_the_stash_when_cli_is_already_back() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let auth_path = cc_switch_lib::get_grok_config_path()
+        .parent()
+        .expect("grok dir")
+        .join("auth.json");
+    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+    let auth = serde_json::to_vec_pretty(&grok_auth_with("native-user")).unwrap();
+    std::fs::write(&auth_path, &auth).unwrap();
+    let stash_path = home.join(".cc-switch").join("grok-login-stash.json");
+    std::fs::create_dir_all(stash_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stash_path,
+        serde_json::to_vec(&json!({"version": 1, "user_id": "native-user", "file_existed": true}))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let state = create_test_state().expect("state");
+    state
+        .db
+        .save_provider(
+            AppType::GrokBuild.as_str(),
+            &grok_official("grokbuild-official", None),
+        )
+        .expect("save");
+    ProviderService::switch(&state, AppType::GrokBuild, "grokbuild-official").expect("switch");
+
+    assert!(!stash_path.exists(), "stash should be consumed");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), auth);
+}
+
+#[test]
+/// 绑了账号的卡，Grok CLI 登录的已经是这个号：不写 auth.json，也不建暂存。
+fn grok_bound_card_leaves_auth_alone_when_cli_already_uses_the_account() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let auth_path = cc_switch_lib::get_grok_config_path()
+        .parent()
+        .expect("grok dir")
+        .join("auth.json");
+    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+    let auth = serde_json::to_vec_pretty(&grok_auth_with("user-a")).unwrap();
+    std::fs::write(&auth_path, &auth).unwrap();
+
+    let state = create_test_state().expect("state");
+    state
+        .db
+        .save_provider(
+            AppType::GrokBuild.as_str(),
+            &grok_official("grok-a", Some("user-a")),
+        )
+        .expect("save");
+    ProviderService::switch(&state, AppType::GrokBuild, "grok-a").expect("switch");
+
+    assert_eq!(std::fs::read(&auth_path).unwrap(), auth);
+    assert!(!home
+        .join(".cc-switch")
+        .join("grok-login-stash.json")
+        .exists());
+}
+
+#[test]
+/// 第三方卡和没有暂存的「跟随 Grok CLI 登录」卡都不碰 auth.json。
+fn grok_unbound_and_third_party_cards_do_not_touch_auth() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    let auth_path = cc_switch_lib::get_grok_config_path()
+        .parent()
+        .expect("grok dir")
+        .join("auth.json");
+    std::fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+    let auth = serde_json::to_vec_pretty(&grok_auth_with("someone")).unwrap();
+    std::fs::write(&auth_path, &auth).unwrap();
+
+    let state = create_test_state().expect("state");
+    state
+        .db
+        .save_provider(
+            AppType::GrokBuild.as_str(),
+            &grok_official("grokbuild-official", None),
+        )
+        .expect("save official");
+    state
+        .db
+        .save_provider(
+            AppType::GrokBuild.as_str(),
+            &Provider::with_id(
+                "grok-relay".to_string(),
+                "Relay".to_string(),
+                json!({ "config": "[models]\ndefault = \"grok-4.5\"\n\n[model.\"grok-4.5\"]\nmodel = \"grok-4.5\"\nbase_url = \"https://relay.example/v1\"\nname = \"Relay\"\napi_key = \"xai-relay\"\napi_backend = \"responses\"\ncontext_window = 500000\n" }),
+                None,
+            ),
+        )
+        .expect("save relay");
+
+    ProviderService::switch(&state, AppType::GrokBuild, "grok-relay").expect("relay");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), auth);
+    ProviderService::switch(&state, AppType::GrokBuild, "grokbuild-official").expect("official");
+    assert_eq!(std::fs::read(&auth_path).unwrap(), auth);
+}

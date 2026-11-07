@@ -268,7 +268,7 @@
         "defaultDescription": "Uses whichever account Grok CLI is signed in to",
         "missing": "Account not on this computer",
         "manage": "Add or manage xAI accounts",
-        "help": "When you switch to this card, Grok CLI's sign-in (~/.grok/auth.json) changes to the selected account. The account signed in before is saved to the auth center first, so it isn't lost.",
+        "help": "When you switch to this card, Grok CLI's sign-in (~/.grok/auth.json) changes to the selected account. The account signed in before is saved to the auth center first and comes back when you switch to the \"Follow Grok CLI sign-in\" card.",
         "xaiAccount": "xAI account",
         "reauthBadge": "Sign in again"
       }
