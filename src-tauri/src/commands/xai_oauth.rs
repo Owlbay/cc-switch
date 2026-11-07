@@ -81,6 +81,46 @@ pub(crate) async fn query_xai_oauth_quota_for(
     Ok(quota)
 }
 
+/// Grok Build 官方卡的订阅额度：先读 Grok CLI 凭据，查不到时用授权中心的同一账号兜底
+///
+/// Grok CLI 只在自己运行时刷新 ~/.grok/auth.json 的访问令牌（约 6 小时过期），
+/// 几天不用 Grok 卡片就会一直「令牌待刷新」。授权中心的 xAI 账号与 Grok CLI 是
+/// 同一个 OAuth client，令牌由 cc-switch 自己刷新；只要账号 id 与 Grok CLI 登录的
+/// `user_id` 一致，查到的就是同一份订阅额度。只读，不改 Grok CLI 的凭据文件。
+/// 瞬时失败（`Err`）不兜底，保持前端 retry + 保留上次成功值的语义。
+pub(crate) async fn query_grokbuild_quota_with_managed_fallback(
+    state: Option<&XaiOAuthState>,
+) -> Result<SubscriptionQuota, String> {
+    let primary = crate::services::subscription_grok::get_grok_subscription_quota().await?;
+    if primary.success {
+        return Ok(primary);
+    }
+    let (Some(state), Some(user_id)) = (
+        state,
+        crate::services::subscription_grok::grok_cli_user_id(),
+    ) else {
+        return Ok(primary);
+    };
+    let has_account = state
+        .0
+        .read()
+        .await
+        .list_accounts()
+        .await
+        .iter()
+        .any(|account| account.id == user_id && !account.requires_reauth);
+    if !has_account {
+        return Ok(primary);
+    }
+    match query_xai_oauth_quota_for(state, Some(user_id), false).await {
+        Ok(mut quota) if quota.success => {
+            quota.tool = "grokbuild".to_string();
+            Ok(quota)
+        }
+        _ => Ok(primary),
+    }
+}
+
 /// 查询 xAI OAuth (SuperGrok 反代) 订阅额度
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_xai_oauth_quota(

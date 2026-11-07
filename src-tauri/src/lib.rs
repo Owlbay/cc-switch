@@ -19,6 +19,7 @@ mod dsh_config;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
+mod grok_auth;
 mod grok_config;
 pub mod hermes_config;
 mod init_status;
@@ -1356,8 +1357,12 @@ pub fn run() {
                 use tokio::sync::RwLock;
 
                 let app_config_dir = crate::config::get_app_config_dir();
-                let xai_oauth_manager = XaiOAuthManager::new(app_config_dir);
-                app.manage(XaiOAuthState(Arc::new(RwLock::new(xai_oauth_manager))));
+                let xai_oauth_manager = Arc::new(RwLock::new(XaiOAuthManager::new(app_config_dir)));
+                // 切 Grok 官方卡（同步代码路径，拿不到 tauri State）要用同一个实例
+                crate::proxy::providers::xai_oauth_auth::register_shared_manager(
+                    xai_oauth_manager.clone(),
+                );
+                app.manage(XaiOAuthState(xai_oauth_manager));
                 log::info!("✓ XaiOAuthManager initialized");
             }
 

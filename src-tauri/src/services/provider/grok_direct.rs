@@ -8,6 +8,7 @@
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
+use crate::grok_auth::GrokAuthPatch;
 use crate::grok_config::get_grok_config_path;
 
 use crate::live::engine::{DeviceStore, LiveFile};
@@ -32,6 +33,65 @@ pub(crate) fn config_file() -> LiveFile {
 /// 官方卡：不写模型表，Grok 回落到内置模型和自带的 xAI 登录。
 pub(crate) fn is_official(provider: &Provider) -> bool {
     provider.category.as_deref() == Some("official")
+}
+
+/// 官方卡绑定的授权中心 xAI 账号：切到这张卡时 Grok CLI 的登录换成这个号。
+pub(crate) fn bound_account(provider: &Provider) -> Option<String> {
+    if !is_official(provider) {
+        return None;
+    }
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("xai_oauth"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// 写 Grok CLI 登录要用的东西，在拿写锁之前备好（可能联网刷新令牌）。
+///
+/// - 卡没绑账号、或 Grok CLI 现在登录的就是这个号：不写登录，返回 `None`；
+/// - 要换号时先把 CLI 现在的登录收进授权中心（它可能轮换过 refresh token，或者是没在
+///   授权中心的号），免得被覆盖后丢掉；再取目标账号的登录。
+pub(crate) fn prepare_login(target: &Provider) -> Result<Option<GrokAuthPatch>, AppError> {
+    let Some(account_id) = bound_account(target) else {
+        return Ok(None);
+    };
+    let live = crate::grok_auth::read_live_login_from_disk();
+    if live.as_ref().is_some_and(|live| live.user_id == account_id) {
+        return Ok(None);
+    }
+    let manager = crate::proxy::providers::xai_oauth_auth::shared_manager().ok_or_else(|| {
+        AppError::Message("xAI 账号管理器尚未初始化，无法切换 Grok 登录".to_string())
+    })?;
+    std::thread::spawn(move || {
+        tauri::async_runtime::block_on(async move {
+            let manager = manager.read().await;
+            if let Some(live) = &live {
+                manager.absorb_grok_cli_login(live).await.map_err(|e| {
+                    AppError::localized(
+                        "grokbuild.login.absorb_failed",
+                        format!("无法确认 Grok CLI 现在的登录，为避免丢掉它，本次没有切换：{e}"),
+                        format!(
+                            "Could not verify Grok CLI's current login, so nothing was switched to avoid losing it: {e}"
+                        ),
+                    )
+                })?;
+            }
+            let login = manager.grok_cli_login(&account_id).await.map_err(|e| {
+                AppError::localized(
+                    "grokbuild.login.account_unavailable",
+                    format!("授权中心的 xAI 账号不可用，请在授权中心重新登录：{e}"),
+                    format!("The xAI account in the auth center is unavailable; sign in again there: {e}"),
+                )
+            })?;
+            // 收进授权中心时可能刚把新令牌写回 CLI：按现在的盘面做发布前的比对
+            let expected = crate::grok_auth::read_live_login_from_disk();
+            Ok(Some(GrokAuthPatch { login, expected }))
+        })
+    })
+    .join()
+    .map_err(|_| AppError::Message("Grok 登录准备线程异常退出".to_string()))?
 }
 
 /// 供应商要写的模型表。写之前校验，校验不过什么都不写。
@@ -100,12 +160,15 @@ fn write(
     pointer: Option<&str>,
 ) -> Result<OperationReport, AppError> {
     let projection = projection(target)?;
-    run(
+    let login = prepare_login(target)?;
+    run_all(
         db,
         op,
         live_owner,
         Some(&projection),
         PendingTarget::pointer(pointer.map(str::to_string)),
+        None,
+        login.as_ref(),
     )
 }
 
@@ -127,8 +190,21 @@ pub(crate) fn run_with_edits(
     op: &str,
     live_owner: Option<&Provider>,
     projection: Option<&GrokProjection>,
+    target: PendingTarget,
+    edits: Option<&TomlEdits>,
+) -> Result<OperationReport, AppError> {
+    run_all(db, op, live_owner, projection, target, edits, None)
+}
+
+/// 同 [`run_with_edits`]，另把绑定账号的登录写进 `auth.json`（和 `config.toml` 同一个操作）。
+fn run_all(
+    db: &Database,
+    op: &str,
+    live_owner: Option<&Provider>,
+    projection: Option<&GrokProjection>,
     mut target: PendingTarget,
     edits: Option<&TomlEdits>,
+    login: Option<&GrokAuthPatch>,
 ) -> Result<OperationReport, AppError> {
     // 先补完上一次没做完的操作：它可能改了写入记录和指针，下面要按最新的记录删表。
     let app_write = AppWrite::begin(db, app())?;
@@ -156,12 +232,18 @@ pub(crate) fn run_with_edits(
         steps.push(patch);
     }
     let write = TomlSteps(steps);
-    let changes: Vec<FileChange<'_>> = (!write.0.is_empty())
+    let mut changes: Vec<FileChange<'_>> = (!write.0.is_empty())
         .then(|| FileChange {
             file: config_file(),
             patch: &write,
         })
         .into_iter()
         .collect();
+    if let Some(login) = login {
+        changes.push(FileChange {
+            file: LiveFile::private(crate::grok_auth::auth_path()),
+            patch: login,
+        });
+    }
     app_write.run(op, &changes, target)
 }

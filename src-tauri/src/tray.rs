@@ -948,8 +948,11 @@ fn tray_usage_source(app_type: &AppType, provider: &Provider) -> Option<TrayUsag
             .unwrap_or(true);
         return enabled.then_some(TrayUsageSource::ClaudeAccount(account_id));
     }
-    // xAI OAuth 的额度属于绑定的 SuperGrok 账号，不是所在应用的客户端登录，仍走脚本路径。
-    if provider_uses_official_subscription(provider) && !provider.is_xai_oauth() {
+    // xAI OAuth 的额度属于绑定的 SuperGrok 账号，不是所在应用的客户端登录，仍走脚本路径；
+    // 绑了授权中心账号的 Grok 官方卡同理。
+    let grok_bound = *app_type == AppType::GrokBuild
+        && crate::services::provider::grok_direct::bound_account(provider).is_some();
+    if provider_uses_official_subscription(provider) && !provider.is_xai_oauth() && !grok_bound {
         return Some(TrayUsageSource::Subscription);
     }
     (provider.has_usage_script_enabled()

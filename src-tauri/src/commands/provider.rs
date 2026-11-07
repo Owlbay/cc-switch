@@ -847,6 +847,21 @@ async fn query_provider_usage_inner(
                 .and_then(|m| m.managed_account_id_for("xai_oauth"));
             crate::commands::xai_oauth::query_xai_oauth_quota_for(xai_state, account_id, false)
                 .await?
+        } else if let Some(account_id) = provider
+            .filter(|_| matches!(app_type, AppType::GrokBuild))
+            .and_then(crate::services::provider::grok_direct::bound_account)
+        {
+            // 绑了授权中心账号的 Grok 官方卡：额度就是这个号的
+            crate::commands::xai_oauth::query_xai_oauth_quota_for(
+                xai_state,
+                Some(account_id),
+                false,
+            )
+            .await?
+        } else if matches!(app_type, AppType::GrokBuild) {
+            crate::commands::xai_oauth::query_grokbuild_quota_with_managed_fallback(Some(xai_state))
+                .await
+                .map_err(|e| format!("Failed to query subscription quota: {e}"))?
         } else {
             crate::services::subscription::get_subscription_quota(app_type.as_str())
                 .await

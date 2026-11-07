@@ -261,6 +261,16 @@
           "teamPremium": "Team Premium",
           "enterprise": "Enterprise"
         }
+      },
+      "grokAccount": {
+        "label": "Sign-in",
+        "default": "Follow Grok CLI sign-in",
+        "defaultDescription": "Uses whichever account Grok CLI is signed in to",
+        "missing": "Account not on this computer",
+        "manage": "Add or manage xAI accounts",
+        "help": "When you switch to this card, Grok CLI's sign-in (~/.grok/auth.json) changes to the selected account. The account signed in before is saved to the auth center first, so it isn't lost.",
+        "xaiAccount": "xAI account",
+        "reauthBadge": "Sign in again"
       }
     },
     "duplicateLiveIdsLoadFailed": "Failed to read provider identifiers from config, please fix the config and try again",
