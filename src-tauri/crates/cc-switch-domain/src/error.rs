@@ -27,3 +27,11 @@ impl DomainError {
         }
     }
 }
+
+/// 与 `impl From<AppError> for String` 对齐：返回 `Result<_, String>` 的 Tauri 命令可以直接对
+/// `AppType::from_str(..)` 用 `?`，文本与转成 `AppError` 后一致。
+impl From<DomainError> for String {
+    fn from(err: DomainError) -> Self {
+        err.to_string()
+    }
+}

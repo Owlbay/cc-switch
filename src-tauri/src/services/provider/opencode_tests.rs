@@ -5,16 +5,16 @@ use crate::opencode_config;
 use crate::provider::Provider;
 use crate::settings::{get_settings, update_settings, AppSettings};
 use crate::store::AppState;
+use crate::test_support::EnvVars;
 use serde_json::json;
 use serial_test::serial;
-use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 struct Fixture {
     previous_settings: AppSettings,
-    previous_env: Vec<(&'static str, Option<OsString>)>,
+    _env: EnvVars,
     config_path: PathBuf,
     state: AppState,
     _dir: tempfile::TempDir,
@@ -23,12 +23,9 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let previous_env = ["CC_SWITCH_TEST_HOME", "OPENCODE_DB"]
-            .into_iter()
-            .map(|key| (key, std::env::var_os(key)))
-            .collect();
-        std::env::set_var("CC_SWITCH_TEST_HOME", dir.path());
-        std::env::set_var("OPENCODE_DB", dir.path().join("opencode.db"));
+        let env = EnvVars::new()
+            .set("CC_SWITCH_TEST_HOME", dir.path())
+            .set("OPENCODE_DB", dir.path().join("opencode.db"));
         let previous_settings = get_settings();
         let config_dir = dir.path().join("opencode");
         fs::create_dir_all(&config_dir).unwrap();
@@ -39,7 +36,7 @@ impl Fixture {
         .unwrap();
         Self {
             previous_settings,
-            previous_env,
+            _env: env,
             config_path: config_dir.join("opencode.json"),
             state: AppState::new(Arc::new(Database::memory().unwrap())),
             _dir: dir,
@@ -59,12 +56,6 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Restore the cached settings while writes still target the temporary home.
         update_settings(self.previous_settings.clone()).unwrap();
-        for (key, value) in &self.previous_env {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 }
 
@@ -182,6 +173,30 @@ fn opencode_builtin_incomplete_copies_cannot_be_added_to_live() {
 
 #[test]
 #[serial]
+fn additive_add_rolls_back_row_when_live_config_cannot_be_parsed() {
+    let fixture = Fixture::new();
+    let broken = "{ \"provider\": ";
+    fs::write(&fixture.config_path, broken).unwrap();
+    let provider = Provider::with_id(
+        "custom-new".into(),
+        "New provider".into(),
+        json!({"npm": "@ai-sdk/openai-compatible", "models": {"glm-5": {"name": "GLM 5"}}}),
+        None,
+    );
+
+    ProviderService::add(&fixture.state, AppType::OpenCode, provider, true).unwrap_err();
+
+    assert!(fixture
+        .state
+        .db
+        .get_provider_by_id("custom-new", "opencode")
+        .unwrap()
+        .is_none());
+    assert_eq!(fs::read_to_string(&fixture.config_path).unwrap(), broken);
+}
+
+#[test]
+#[serial]
 fn opencode_builtin_removed_override_cannot_reuse_live_membership() {
     let fixture = Fixture::new();
     fs::write(&fixture.config_path, KEY_ONLY_CONFIG).unwrap();
@@ -197,6 +212,9 @@ fn opencode_builtin_removed_override_cannot_reuse_live_membership() {
 #[test]
 #[serial]
 fn opencode_builtin_credential_only_import_does_not_create_config() {
+    if crate::config::sqlite_unsupported_in_temp_dir() {
+        return;
+    }
     let fixture = Fixture::new();
     let db_path = opencode_config::get_opencode_db_path();
     let db = rusqlite::Connection::open(&db_path).unwrap();
@@ -300,7 +318,7 @@ fn opencode_jsonc_provider_and_mcp_workflows_preserve_comments() {
             json!({"type":"http","url":"https://example.com/mcp"}),
         ),
     ] {
-        crate::mcp::sync_single_server_to_opencode(&config, id, &spec).unwrap();
+        crate::mcp::sync_single_server_to_opencode(id, &spec).unwrap();
     }
     let servers = opencode_config::get_mcp_servers().unwrap();
     assert_eq!(servers["existing"]["command"], json!(["npx", "updated"]));

@@ -5,6 +5,11 @@ import type { KnownModelMetadata } from "@/lib/modelMetadata";
 import type { CodexCatalogModel, OpenClawModel, OpenCodeModel } from "@/types";
 import type { HermesModel } from "@/config/hermesProviderPresets";
 import {
+  workbuddyThinkingFields,
+  type WorkBuddyModel,
+} from "@/config/workbuddyProviderPresets";
+import type { KimiProviderConfig } from "@/config/kimiProviderPresets";
+import {
   PI_THINKING_LEVELS,
   type PiThinkingLevelMap,
 } from "@/config/piThinkingProfiles";
@@ -40,7 +45,9 @@ export function fillCodexCatalogModel<T extends CodexCatalogModel>(
     );
     if (levels.length > 0) next.reasoningLevels = levels;
   }
-  if (!row.inputModalities && metadata.inputModalities) {
+  // 只补「支持图片」：没写时后端按注册表判断、认不出就当支持；查到只收文字就写
+  // ["text"] 会关掉 Codex 的图片入口，而编辑界面又没有改回来的地方（#8682）。
+  if (!row.inputModalities && metadata.inputModalities?.includes("image")) {
     next.inputModalities = textImageModalities(metadata.inputModalities);
   }
   return next;
@@ -78,13 +85,61 @@ export function fillOpenClawModel(
   return next;
 }
 
+/**
+ * WorkBuddy models.json 条目：数字只补空的，推理和图片输入只往「支持」补
+ * （新建的行默认 `supportsImages: false`，模型支持图片就改成 true）。
+ */
+export function fillWorkBuddyModel(
+  model: WorkBuddyModel,
+  metadata: KnownModelMetadata,
+  baseUrl: string,
+): WorkBuddyModel {
+  let next = { ...model };
+  if (isBlank(model.maxInputTokens) && metadata.contextWindow) {
+    next.maxInputTokens = metadata.contextWindow;
+  }
+  if (isBlank(model.maxOutputTokens) && metadata.maxOutputTokens) {
+    next.maxOutputTokens = metadata.maxOutputTokens;
+  }
+  if (metadata.reasoning === true) next.supportsReasoning = true;
+  if (metadata.inputModalities?.includes("image")) next.supportsImages = true;
+  // 思考强度：WorkBuddy CLI 内置 pi-ai，档位映射与 Pi 同规则补，只是不往条目里补
+  // compat（预设映射要靠 compat 才成立时跳过）。用户已有映射或强度的不动。
+  if (next.supportsReasoning && !model.reasoning && !model.thinkingLevelMap) {
+    const effective: PiProviderProtocol = {
+      api: "openai-completions",
+      baseUrl,
+      providerId: "",
+      compat: {},
+    };
+    const preset = piPresetThinkingFor(metadata.piThinking, effective);
+    const map =
+      preset && Object.keys(preset.missingCompat).length === 0
+        ? preset.map
+        : piSendsReasoningEffort(effective)
+          ? piThinkingLevelMapFromEfforts(metadata.reasoningEfforts)
+          : undefined;
+    if (map) next = { ...next, ...workbuddyThinkingFields(map) };
+  }
+  return next;
+}
+
 export function fillHermesModel(
   model: HermesModel,
   metadata: KnownModelMetadata,
 ): HermesModel {
-  return isBlank(model.context_length) && metadata.contextWindow
-    ? { ...model, context_length: metadata.contextWindow }
-    : model;
+  const next = { ...model };
+  if (isBlank(model.context_length) && metadata.contextWindow) {
+    next.context_length = metadata.contextWindow;
+  }
+  // 只补 true：没写时 Hermes 自己查目录，用户明确写的 false 也不动。
+  if (
+    model.supports_vision === undefined &&
+    metadata.inputModalities?.includes("image")
+  ) {
+    next.supports_vision = true;
+  }
+  return next;
 }
 
 export function fillOpenCodeModel(
@@ -105,6 +160,37 @@ export function fillOpenCodeModel(
       input: metadata.inputModalities,
       output: metadata.outputModalities ?? ["text"],
     };
+  }
+  // OpenCode 只给 reasoning 为真的模型生成思考档位（ctrl+t）。只补 true：
+  // 写 false 会盖住 models.dev 同名条目，用户明确写的 false 也不动。
+  if (model.reasoning === undefined && metadata.reasoning === true) {
+    next.reasoning = true;
+  }
+  return next;
+}
+
+type KimiModel = KimiProviderConfig["models"][string];
+
+/**
+ * Kimi 的 `max_context_size` 是必填项，新加的行先带一个占位值；`replaceContext`
+ * 为真表示这一行的窗口还是占位值、可以换成查到的值。能力只往「支持」方向补，
+ * 和 Kimi 按目录导入模型时的取法一致（`image_in` 看输入模态，`thinking` 看
+ * reasoning）。
+ */
+export function fillKimiModel(
+  model: KimiModel,
+  metadata: KnownModelMetadata,
+  { replaceContext }: { replaceContext: boolean },
+): KimiModel {
+  const next = { ...model };
+  if (replaceContext && metadata.contextWindow) {
+    next.max_context_size = metadata.contextWindow;
+  }
+  const capabilities = new Set(model.capabilities ?? []);
+  if (metadata.inputModalities?.includes("image")) capabilities.add("image_in");
+  if (metadata.reasoning === true) capabilities.add("thinking");
+  if (capabilities.size > (model.capabilities?.length ?? 0)) {
+    next.capabilities = [...capabilities];
   }
   return next;
 }

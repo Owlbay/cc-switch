@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   fillCodexCatalogModel,
   fillHermesModel,
+  fillKimiModel,
   fillOpenClawModel,
   fillOpenCodeModel,
+  fillWorkBuddyModel,
   piPresetThinkingFor,
   piSendsReasoningEffort,
   piThinkingLevelMapFromEfforts,
@@ -48,6 +50,19 @@ describe("fillCodexCatalogModel", () => {
     };
     expect(fillCodexCatalogModel(row, metadata, CODEX_LEVELS)).toEqual(row);
   });
+
+  it("never turns image input off for a text-only lookup", () => {
+    expect(
+      fillCodexCatalogModel(
+        { model: "deepseek-v4.1-flash-1017", contextWindow: "" },
+        { contextWindow: 1_000_000, inputModalities: ["text"] },
+        CODEX_LEVELS,
+      ),
+    ).toEqual({
+      model: "deepseek-v4.1-flash-1017",
+      contextWindow: "1000000",
+    });
+  });
 });
 
 describe("fillOpenClawModel", () => {
@@ -86,25 +101,47 @@ describe("fillOpenClawModel", () => {
 });
 
 describe("fillHermesModel", () => {
-  it("fills context_length only when blank", () => {
+  it("fills context_length and supports_vision only when blank", () => {
     expect(fillHermesModel({ id: "m" }, metadata)).toEqual({
       id: "m",
       context_length: 262144,
+      supports_vision: true,
     });
-    expect(fillHermesModel({ id: "m", context_length: 1 }, metadata)).toEqual({
-      id: "m",
-      context_length: 1,
-    });
+    expect(
+      fillHermesModel(
+        { id: "m", context_length: 1, supports_vision: true },
+        metadata,
+      ),
+    ).toEqual({ id: "m", context_length: 1, supports_vision: true });
+  });
+
+  it("only fills supports_vision towards true and keeps an explicit false", () => {
+    expect(fillHermesModel({ id: "m" }, { inputModalities: ["text"] })).toEqual(
+      { id: "m" },
+    );
+    expect(
+      fillHermesModel({ id: "m", supports_vision: false }, metadata),
+    ).toEqual({ id: "m", context_length: 262144, supports_vision: false });
   });
 });
 
 describe("fillOpenCodeModel", () => {
-  it("fills missing limits and modalities", () => {
+  it("fills missing limits, modalities and reasoning", () => {
     expect(fillOpenCodeModel({ name: "m" }, metadata)).toEqual({
       name: "m",
       limit: { context: 262144, output: 32768 },
+      reasoning: true,
       modalities: { input: ["text", "image", "video"], output: ["text"] },
     });
+  });
+
+  it("only fills reasoning towards true and keeps an explicit value", () => {
+    expect(fillOpenCodeModel({ name: "m" }, { reasoning: false })).toEqual({
+      name: "m",
+    });
+    expect(
+      fillOpenCodeModel({ name: "m", reasoning: false }, { reasoning: true }),
+    ).toEqual({ name: "m", reasoning: false });
   });
 
   it("only fills the missing half of limit", () => {
@@ -121,11 +158,43 @@ describe("fillOpenCodeModel", () => {
       name: "m",
       limit: { context: 1000, output: 32768 },
       modalities: { input: ["text"] },
+      reasoning: true,
     });
   });
 
   it("leaves the model untouched when nothing is known", () => {
     expect(fillOpenCodeModel({ name: "m" }, {})).toEqual({ name: "m" });
+  });
+});
+
+describe("fillKimiModel", () => {
+  it("replaces a placeholder window and adds supported capabilities", () => {
+    expect(
+      fillKimiModel(
+        { model: "m", max_context_size: 1, capabilities: ["tool_use"] },
+        metadata,
+        { replaceContext: true },
+      ),
+    ).toEqual({
+      model: "m",
+      max_context_size: 262144,
+      capabilities: ["tool_use", "image_in", "thinking"],
+    });
+  });
+
+  it("keeps a window the user set and never removes capabilities", () => {
+    const model = {
+      model: "m",
+      max_context_size: 1000,
+      capabilities: ["thinking", "video_in"],
+    };
+    expect(
+      fillKimiModel(
+        model,
+        { contextWindow: 9, inputModalities: ["text"], reasoning: false },
+        { replaceContext: false },
+      ),
+    ).toEqual(model);
   });
 });
 
@@ -263,5 +332,69 @@ describe("piPresetThinkingFor", () => {
         compat: { supportsReasoningEffort: false },
       }),
     ).toBeNull();
+  });
+});
+
+describe("fillWorkBuddyModel", () => {
+  const url = "https://api.example.test/v1";
+  const efforts = {
+    reasoning: {
+      supportedEfforts: ["low", "high", "max"],
+      defaultEffort: "high",
+      canDisableThinking: false,
+    },
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: "low",
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    },
+  };
+
+  it("fills blank limits and only turns capabilities on", () => {
+    expect(
+      fillWorkBuddyModel(
+        { id: "m", supportsToolCall: true, supportsImages: false },
+        metadata,
+        url,
+      ),
+    ).toEqual({
+      id: "m",
+      supportsToolCall: true,
+      supportsImages: true,
+      supportsReasoning: true,
+      maxInputTokens: 262144,
+      maxOutputTokens: 32768,
+      ...efforts,
+    });
+    expect(
+      fillWorkBuddyModel(
+        { id: "m", maxInputTokens: 1000, supportsReasoning: true },
+        { reasoning: false, contextWindow: 2000 },
+        url,
+      ),
+    ).toEqual({ id: "m", maxInputTokens: 1000, supportsReasoning: true });
+  });
+
+  it("derives effort levels only where they reach the upstream", () => {
+    // Moonshot 不认 reasoning_effort（Pi 的探测规则），不列强度
+    expect(
+      fillWorkBuddyModel({ id: "m" }, metadata, "https://api.moonshot.cn/v1"),
+    ).not.toHaveProperty("reasoning");
+    // 已有的强度或映射不动
+    const kept = {
+      id: "m",
+      supportsReasoning: true,
+      thinkingLevelMap: { max: "max" },
+    };
+    expect(fillWorkBuddyModel(kept, metadata, url)).toEqual({
+      ...kept,
+      supportsImages: true,
+      maxInputTokens: 262144,
+      maxOutputTokens: 32768,
+    });
   });
 });

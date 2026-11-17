@@ -17,10 +17,9 @@
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::opencode_config::get_opencode_db_path;
-use crate::proxy::usage::calculator::CostCalculator;
 use crate::proxy::usage::parser::TokenUsage;
 use crate::services::session_usage::{
-    metadata_modified_nanos, update_sync_state, SessionSyncResult,
+    cost_columns, metadata_modified_nanos, update_sync_state, SessionSyncResult,
 };
 use crate::services::usage_stats::{find_model_pricing, should_skip_session_insert, DedupKey};
 use rust_decimal::Decimal;
@@ -37,6 +36,10 @@ struct OpenCodeMessageData {
     cost: f64,
     model_id: String,
     timestamp_ms: i64,
+    /// 耗时终点优先取 time.streamed（流式结束，不含工具执行），缺失或异常时
+    /// 退回 time.completed；离线回填只有整条消息的起止时间，没有首字时间，
+    /// 所以 latency 有值而 first_token_ms 恒为空
+    latency_ms: i64,
 }
 
 struct OpenCodeMessageQueryResult {
@@ -389,6 +392,26 @@ fn parse_message_data(value: &serde_json::Value) -> Option<OpenCodeMessageData> 
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
+    // 耗时终点优先取 time.streamed（流式结束），它不含工具执行时间；
+    // 缺失或早于 created（时钟异常）时退回 time.completed（含工具执行，估速偏低）。
+    // 调用方已过滤掉没有 time.completed 的未完成消息；这里再兜底：
+    // created 缺失（timestamp_ms 回退为 0，差值会变成毫秒纪元值）或
+    // 时钟倒挂（终点不晚于 created）时按 0 处理
+    let time = value.get("time");
+    let streamed_ms = time
+        .and_then(|t| t.get("streamed"))
+        .and_then(|v| v.as_i64());
+    let completed_ms = time
+        .and_then(|t| t.get("completed"))
+        .and_then(|v| v.as_i64());
+    let end_ms = streamed_ms
+        .filter(|&end| end > timestamp_ms)
+        .or(completed_ms);
+    let latency_ms = match end_ms {
+        Some(end) if timestamp_ms > 0 && end > timestamp_ms => end - timestamp_ms,
+        _ => 0,
+    };
+
     Some(OpenCodeMessageData {
         input_tokens,
         output_tokens,
@@ -398,6 +421,7 @@ fn parse_message_data(value: &serde_json::Value) -> Option<OpenCodeMessageData> 
         cost,
         model_id,
         timestamp_ms,
+        latency_ms,
     })
 }
 
@@ -425,6 +449,7 @@ fn insert_opencode_message(
 
     let dedup_key = DedupKey {
         app_type: "opencode",
+        data_source: "opencode_session",
         model: &msg.model_id,
         input_tokens: msg.input_tokens,
         output_tokens: output_with_reasoning,
@@ -437,17 +462,17 @@ fn insert_opencode_message(
     }
 
     // 如果 opencode 已经提供了费用，直接使用；否则从模型定价计算
-    let (input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost) =
+    let [input_cost, output_cost, cache_read_cost, cache_creation_cost, total_cost] =
         if msg.cost > 0.0 {
             // opencode 已计算费用，直接使用
             // 简化处理：全部放入 total_cost（opencode 的 cost 是聚合值，无法精确拆分）
-            (
+            [
                 "0".to_string(),
                 "0".to_string(),
                 "0".to_string(),
                 "0".to_string(),
                 msg.cost.to_string(),
-            )
+            ]
         } else {
             // opencode 费用为 0（如免费模型），尝试用 cc-switch 自带的模型定价计算
             let usage = TokenUsage {
@@ -455,34 +480,17 @@ fn insert_opencode_message(
                 output_tokens: output_with_reasoning,
                 cache_read_tokens: msg.cache_read_tokens,
                 cache_creation_tokens: msg.cache_write_tokens,
+                cache_creation_1h_tokens: 0,
                 model: Some(msg.model_id.clone()),
                 message_id: None,
             };
 
-            match find_model_pricing(&conn, &msg.model_id) {
-                Some(pricing) => {
-                    let cost = CostCalculator::calculate_for_app(
-                        "opencode",
-                        &usage,
-                        &pricing,
-                        Decimal::from(1),
-                    );
-                    (
-                        cost.input_cost.to_string(),
-                        cost.output_cost.to_string(),
-                        cost.cache_read_cost.to_string(),
-                        cost.cache_creation_cost.to_string(),
-                        cost.total_cost.to_string(),
-                    )
-                }
-                None => (
-                    "0".to_string(),
-                    "0".to_string(),
-                    "0".to_string(),
-                    "0".to_string(),
-                    "0".to_string(),
-                ),
-            }
+            cost_columns(
+                "opencode",
+                &usage,
+                find_model_pricing(&conn, &msg.model_id).as_ref(),
+                Decimal::ONE,
+            )
         };
 
     let inserted_rows = conn.execute(
@@ -508,7 +516,8 @@ fn insert_opencode_message(
             cache_read_cost,
             cache_creation_cost,
             total_cost,
-            0i64,                  // latency_ms
+            msg.latency_ms,
+            // opencode.db 里没有首字时间字段，离线回填无法测量 first_token_ms
             Option::<i64>::None,   // first_token_ms
             200i64,                // status_code
             Option::<String>::None,// error_message
@@ -560,6 +569,41 @@ mod tests {
         assert!((data.cost - 0.0023113).abs() < 1e-10);
         assert_eq!(data.model_id, "deepseek-v4-pro");
         assert_eq!(data.timestamp_ms, 1779755333700);
+        assert_eq!(data.latency_ms, 1779755350639 - 1779755333700);
+    }
+
+    #[test]
+    fn test_parse_message_data_latency_fallbacks() {
+        // 没有 time.completed：latency 回退为 0
+        let no_completed = serde_json::json!({
+            "role": "assistant",
+            "tokens": { "input": 1000, "output": 200 },
+            "modelID": "m",
+            "time": { "created": 1000i64 }
+        });
+        let data = parse_message_data(&no_completed).unwrap();
+        assert_eq!(data.latency_ms, 0);
+
+        // completed 早于 created：兜底为 0，不出负数
+        let negative = serde_json::json!({
+            "role": "assistant",
+            "tokens": { "input": 1000, "output": 200 },
+            "modelID": "m",
+            "time": { "created": 2000i64, "completed": 1000i64 }
+        });
+        let data = parse_message_data(&negative).unwrap();
+        assert_eq!(data.latency_ms, 0);
+
+        // 有 completed 但缺 created：差值不能拿毫秒纪元值来算
+        let no_created = serde_json::json!({
+            "role": "assistant",
+            "tokens": { "input": 1000, "output": 200 },
+            "modelID": "m",
+            "time": { "completed": 1779755350639i64 }
+        });
+        let data = parse_message_data(&no_created).unwrap();
+        assert_eq!(data.timestamp_ms, 0);
+        assert_eq!(data.latency_ms, 0);
     }
 
     #[test]
@@ -580,6 +624,8 @@ mod tests {
         assert_eq!(data.reasoning_tokens, 0);
         assert_eq!(data.cache_read_tokens, 0);
         assert_eq!(data.cache_write_tokens, 0);
+        // 未完成消息（无 time.completed）没有可用耗时
+        assert_eq!(data.latency_ms, 0);
     }
 
     #[test]
@@ -703,6 +749,38 @@ mod tests {
         assert_eq!(data.input_tokens, 1373);
         assert_eq!(data.cache_read_tokens, 391040);
         assert_eq!(data.timestamp_ms, 1789945285532);
+        // 有 streamed 时终点取 streamed（流式结束），不含 completed 之后的收尾
+        assert_eq!(data.latency_ms, 1789945288379 - 1789945285532);
+    }
+
+    #[test]
+    fn test_parse_message_data_prefers_streamed_for_latency() {
+        // 同时有 streamed 和 completed：终点取 streamed，排除 completed 之后的工具执行时间
+        let with_streamed = serde_json::json!({
+            "tokens": { "input": 1000, "output": 674 },
+            "model": { "id": "m" },
+            "time": { "created": 1000i64, "streamed": 2000i64, "completed": 120000i64 }
+        });
+        let data = parse_message_data(&with_streamed).unwrap();
+        assert_eq!(data.latency_ms, 1000);
+
+        // 只有 completed：退回 completed
+        let only_completed = serde_json::json!({
+            "tokens": { "input": 1000, "output": 674 },
+            "model": { "id": "m" },
+            "time": { "created": 1000i64, "completed": 3000i64 }
+        });
+        let data = parse_message_data(&only_completed).unwrap();
+        assert_eq!(data.latency_ms, 2000);
+
+        // streamed 早于 created（时钟异常）：忽略 streamed，退回 completed
+        let skewed = serde_json::json!({
+            "tokens": { "input": 1000, "output": 674 },
+            "model": { "id": "m" },
+            "time": { "created": 5000i64, "streamed": 4000i64, "completed": 9000i64 }
+        });
+        let data = parse_message_data(&skewed).unwrap();
+        assert_eq!(data.latency_ms, 4000);
     }
 
     #[test]

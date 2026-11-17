@@ -9,7 +9,7 @@ use super::{
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::{ProxyResponse, MAX_RESPONSE_BODY_BYTES},
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{strip_sse_field, SseBuffer},
     usage::parser::TokenUsage,
     ProxyError,
 };
@@ -142,9 +142,19 @@ pub(crate) async fn read_decoded_body(
 // ============================================================================
 
 /// 检测响应是否为 SSE 流式响应
+///
+/// 上游标了 `text/event-stream` 就是流；客户端要的是流（`request_is_stream`）、
+/// 上游 2xx 却完全不带 Content-Type 时也按流处理。chatgpt.com 的 Codex
+/// Responses 回包就不带这个头：当成整包读会把实时输出攒到回合结束才一次性
+/// 交给客户端，SSE 文本按 JSON 解析失败，用量记成 0（会话日志导入随之去重
+/// 不上，同一回合出现两行）。只认“缺头”，不认任意非 JSON：网关忽略
+/// `stream: true`、回一个标成 `text/plain` 的 JSON 时，仍按整包解析用量。
 #[inline]
-pub fn is_sse_response(response: &ProxyResponse) -> bool {
+pub fn is_sse_response(response: &ProxyResponse, request_is_stream: bool) -> bool {
     response.is_sse()
+        || (request_is_stream
+            && response.status().is_success()
+            && response.content_type().is_none())
 }
 
 /// 处理流式响应
@@ -328,9 +338,10 @@ pub async fn process_response(
     ctx: &RequestContext,
     state: &ProxyState,
     parser_config: &UsageParserConfig,
+    request_is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
 ) -> Result<Response, ProxyError> {
-    if is_sse_response(&response) {
+    if is_sse_response(&response, request_is_stream) {
         Ok(handle_streaming(response, ctx, state, parser_config, connection_guard).await)
     } else {
         handle_non_streaming(response, ctx, state, parser_config, connection_guard).await
@@ -659,14 +670,6 @@ async fn log_usage_internal(
 ) {
     use super::usage::logger::UsageLogger;
 
-    let logger = UsageLogger::new(&state.db);
-    let pricing_model_source = logger.resolve_pricing_model_source(app_type).await;
-    let pricing_model = if pricing_model_source == PRICING_SOURCE_REQUEST {
-        outbound_model
-    } else {
-        model
-    };
-
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
     let request_id = usage.dedup_request_id(dedup_scope);
 
@@ -679,21 +682,47 @@ async fn log_usage_internal(
         usage.cache_creation_tokens
     );
 
-    if let Err(e) = logger.log_with_calculation(
-        request_id,
-        provider_id.to_string(),
-        app_type.to_string(),
-        model.to_string(),
-        request_model.to_string(),
-        pricing_model.to_string(),
-        usage,
-        latency_ms,
-        first_token_ms,
-        status_code,
-        session_id,
-        None, // provider_type
-        is_streaming,
-    ) {
+    // #7818：使用量写入要拿 Database 的单把 std::sync::Mutex<Connection> 并做
+    // 磁盘 IO，同步执行会卡住 tokio worker，移到阻塞线程池执行。计费模式
+    // 读取走同一把锁，一并移入。
+    let db = state.db.clone();
+    let provider_id = provider_id.to_string();
+    let app_type = app_type.to_string();
+    let model = model.to_string();
+    let request_model = request_model.to_string();
+    let outbound_model = outbound_model.to_string();
+    let write = tokio::task::spawn_blocking(move || {
+        let logger = UsageLogger::new(&db);
+        // 计费模式读取的 DAO 是伪 async（无真实挂起点、直接取阻塞锁），
+        // 在阻塞线程上 block_on 不会停转运行时
+        let pricing_model_source = tokio::runtime::Handle::current()
+            .block_on(logger.resolve_pricing_model_source(&app_type));
+        let pricing_model = if pricing_model_source == PRICING_SOURCE_REQUEST {
+            outbound_model
+        } else {
+            model.clone()
+        };
+        logger.log_with_calculation(
+            request_id,
+            provider_id,
+            app_type,
+            model,
+            request_model,
+            pricing_model,
+            usage,
+            latency_ms,
+            first_token_ms,
+            status_code,
+            session_id,
+            None, // provider_type
+            is_streaming,
+        )
+    });
+    if let Err(e) = write.await.unwrap_or_else(|e| {
+        Err(crate::error::AppError::Database(format!(
+            "usage 记录任务失败: {e}"
+        )))
+    }) {
         log::warn!("[USG-001] 记录使用量失败: {e}");
     }
 }
@@ -708,8 +737,7 @@ pub fn create_logged_passthrough_stream(
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut sse = SseBuffer::new();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
@@ -765,10 +793,10 @@ pub fn create_logged_passthrough_stream(
                     }
                     is_first_chunk = false;
                     if inspect_sse_events {
-                        crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                        sse.push_bytes(&bytes);
 
                         // 尝试解析并记录完整的 SSE 事件
-                        while let Some(event_text) = take_sse_block(&mut buffer) {
+                        while let Some(event_text) = sse.next_block() {
                             if !event_text.trim().is_empty() {
                                 let event_name = event_text
                                     .lines()
@@ -1015,6 +1043,46 @@ mod tests {
         );
     }
 
+    fn response_with_content_type(
+        status: http::StatusCode,
+        content_type: Option<&'static str>,
+    ) -> ProxyResponse {
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = content_type {
+            headers.insert("content-type", content_type.parse().unwrap());
+        }
+        ProxyResponse::buffered(status, headers, Bytes::new())
+    }
+
+    #[test]
+    fn stream_request_without_content_type_is_treated_as_sse() {
+        // chatgpt.com 的 Codex Responses 回包不带 Content-Type。
+        let response = response_with_content_type(http::StatusCode::OK, None);
+        assert!(is_sse_response(&response, true));
+        assert!(!is_sse_response(&response, false));
+    }
+
+    #[test]
+    fn declared_content_type_wins_over_stream_flag() {
+        let sse = response_with_content_type(
+            http::StatusCode::OK,
+            Some("text/event-stream;charset=utf-8"),
+        );
+        assert!(is_sse_response(&sse, false));
+
+        // 网关忽略 stream: true 时回的 JSON（无论标成什么）仍按整包解析用量。
+        for content_type in ["application/json", "text/plain"] {
+            let response = response_with_content_type(http::StatusCode::OK, Some(content_type));
+            assert!(!is_sse_response(&response, true), "{content_type}");
+        }
+    }
+
+    #[test]
+    fn stream_request_error_without_content_type_stays_buffered() {
+        let response = response_with_content_type(http::StatusCode::BAD_REQUEST, None);
+        assert!(!is_sse_response(&response, true));
+    }
+
     #[test]
     fn test_strip_sse_field_accepts_optional_space() {
         assert_eq!(
@@ -1191,6 +1259,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
             model: None,
             message_id: None,
         };
@@ -1255,6 +1324,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
             model: None,
             message_id: None,
         };
@@ -1313,5 +1383,145 @@ mod tests {
 
         assert_eq!(source, "request");
         Ok(())
+    }
+
+    // #7818 回归闸门：使用量写入必须离开异步执行器线程。
+    // Database 全局只有单把 std::sync::Mutex<Connection>，先让专用线程占住
+    // 这把锁模拟慢盘/竞争。修复前，log_usage_internal 会在当前 tokio worker
+    // 上同步等锁，单线程（current_thread）运行时被整个卡死，下方的心跳
+    // sleep 只能在锁释放（约 500ms）后才会醒来；修复后写入走阻塞线程池，
+    // sleep 照常在 100ms 触发。
+    #[tokio::test]
+    async fn log_usage_write_does_not_block_the_async_runtime() -> Result<(), AppError> {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let db = Arc::new(Database::memory()?);
+        let app_type = "claude";
+
+        db.set_pricing_model_source(app_type, "response").await?;
+        seed_pricing(&db)?;
+        insert_provider(&db, "provider-busy", app_type, ProviderMeta::default())?;
+
+        let state = build_state(db.clone());
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            model: None,
+            message_id: None,
+        };
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let blocker_db = db.clone();
+        let blocker = thread::spawn(move || {
+            let _guard = blocker_db.conn.lock().expect("占锁失败");
+            locked_tx.send(()).expect("通知占锁失败");
+            // 无论被测代码走哪条路径都定时释放，测试不会挂死
+            thread::sleep(Duration::from_millis(500));
+        });
+        locked_rx.recv().expect("接收占锁通知失败");
+
+        let writer = tokio::spawn(async move {
+            log_usage_internal(
+                &state,
+                "provider-busy",
+                app_type,
+                "resp-model",
+                "req-model",
+                "req-model",
+                usage,
+                10,
+                None,
+                false,
+                200,
+                None,
+            )
+            .await;
+        });
+
+        let start = Instant::now();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let heartbeat = start.elapsed();
+        blocker.join().expect("占锁线程 panic");
+        writer.await.expect("使用量写入任务 panic");
+
+        assert!(
+            heartbeat < Duration::from_millis(300),
+            "使用量写入阻塞了异步执行器 {heartbeat:?}（应移到阻塞线程池执行）"
+        );
+
+        // 锁释放后记录最终仍要落库
+        let conn = crate::database::lock_conn!(db.conn);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_request_logs WHERE provider_id = ?1",
+                ["provider-busy"],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    /// Gemini `alt=sse` 流式响应（Antigravity 等 Gemini 客户端）经透传流后，
+    /// 尾 chunk 的 usageMetadata 必须能被收集并解析成 token usage。
+    #[tokio::test]
+    async fn gemini_sse_stream_feeds_collector_and_parses_usage() {
+        use crate::proxy::handler_config::GEMINI_PARSER_CONFIG;
+        use crate::proxy::usage::parser::TokenUsage;
+        use futures::StreamExt;
+
+        let sse_body = concat!(
+            "data: {\"responseId\":\"resp_1\",\"modelVersion\":\"gemini-3.8-flash\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"he\"}]}}]}\n\n",
+            "data: {\"responseId\":\"resp_1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"llo\"}]}}]}\n\n",
+            "data: {\"responseId\":\"resp_1\",\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":258,\"totalTokenCount\":277,\"cachedContentTokenCount\":160}}\n\n",
+        );
+
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collector = SseUsageCollector::new(
+            std::time::Instant::now(),
+            GEMINI_PARSER_CONFIG.stream_event_filter,
+            {
+                let collected = collected.clone();
+                move |events, _| {
+                    *collected.lock().unwrap() = events;
+                }
+            },
+        );
+
+        let stream = futures::stream::iter(vec![Ok::<_, std::io::Error>(
+            sse_body.as_bytes().to_vec().into(),
+        )]);
+        let passthrough = create_logged_passthrough_stream(
+            stream,
+            "test",
+            Some(collector),
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+        );
+        futures::pin_mut!(passthrough);
+        while let Some(chunk) = passthrough.next().await {
+            chunk.expect("passthrough chunk");
+        }
+
+        let events = collected.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            2,
+            "含 modelVersion 的首 chunk 与含 usageMetadata 的尾 chunk 都应被收集: {events:?}"
+        );
+        let usage =
+            TokenUsage::from_gemini_stream_chunks(&events).expect("Gemini 流式 usage 应可解析");
+        assert_eq!(usage.input_tokens, 258);
+        assert_eq!(usage.output_tokens, 19);
+        assert_eq!(usage.cache_read_tokens, 160);
+        assert_eq!(usage.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(usage.message_id.as_deref(), Some("resp_1"));
     }
 }

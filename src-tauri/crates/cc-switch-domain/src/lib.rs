@@ -8,6 +8,6 @@ pub mod constants;
 mod error;
 pub mod usage_semantics;
 
-pub use app_type::AppType;
+pub use app_type::{AppSpec, AppType};
 pub use constants::*;
 pub use error::DomainError;

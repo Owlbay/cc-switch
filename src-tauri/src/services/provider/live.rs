@@ -30,7 +30,17 @@ pub(crate) fn provider_exists_in_live_config(
         AppType::Hermes => crate::hermes_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
         AppType::Pi => crate::pi_config::pi_provider_exists(provider_id),
+        AppType::Dsh => {
+            crate::dsh_config::get_providers().map(|providers| providers.contains_key(provider_id))
+        }
+        AppType::Kimi => {
+            crate::kimi_config::get_providers().map(|providers| providers.contains_key(provider_id))
+        }
         AppType::Mcode => crate::mcode_config::get_providers()
+            .map(|providers| providers.contains_key(provider_id)),
+        AppType::Omp => Ok(crate::omp_config::get_providers()?.contains_key(provider_id)),
+        AppType::Copilot => crate::copilot_config::provider_key_exists(provider_id),
+        AppType::WorkBuddy => crate::workbuddy_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
         _ => Ok(false),
     }
@@ -301,6 +311,12 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
         | AppType::Hermes
         | AppType::Pi
         | AppType::Mcode
+        | AppType::Kimi
+        | AppType::Dsh
+        | AppType::Agy
+        | AppType::Omp
+        | AppType::Copilot
+        | AppType::WorkBuddy
         | AppType::ClaudeDesktop => false,
     }
 }
@@ -377,7 +393,13 @@ pub(crate) fn remove_common_config_from_settings(
         | AppType::Hermes
         | AppType::Pi
         | AppType::Mcode
-        | AppType::ClaudeDesktop => Ok(settings.clone()),
+        | AppType::Kimi
+        | AppType::Dsh
+        | AppType::ClaudeDesktop
+        | AppType::Agy
+        | AppType::Omp
+        | AppType::Copilot
+        | AppType::WorkBuddy => Ok(settings.clone()),
     }
 }
 
@@ -414,6 +436,12 @@ pub(crate) fn write_live_for_state(
     }
     if matches!(app_type, AppType::GrokBuild) {
         super::grok_direct::reapply(db, Some(provider), provider)?;
+        return Ok(());
+    }
+    if matches!(app_type, AppType::Agy | AppType::Copilot) {
+        // Antigravity 的卡只作用于它打开的终端，全量同步不写真实 settings.json。Copilot 自带
+        // 模型卡只经「添加 / 编辑」写进 providers.json（文件里的条目归 Copilot，列表从文件读回），
+        // 全量同步不重写它；官方卡从不写文件。
         return Ok(());
     }
 
@@ -562,27 +590,24 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
         AppType::OpenCode => {
             // OpenCode uses additive mode - write provider to config
             use crate::opencode_config;
-            use crate::provider::OpenCodeProviderConfig;
+            use crate::provider::{OpenCodeConfigFormat, OpenCodeProviderConfig};
+            use serde::Deserialize;
 
-            // Defensive check: if settings_config is a full config structure, extract provider fragment
-            let config_to_write = if let Some(obj) = provider.settings_config.as_object() {
-                // Detect full config structure (has $schema or top-level provider field)
-                if obj.contains_key("$schema") || obj.contains_key("provider") {
-                    log::warn!(
-                        "OpenCode provider '{}' has full config structure in settings_config, attempting to extract fragment",
-                        provider.id
-                    );
-                    // Try to extract from provider.{id}
-                    obj.get("provider")
-                        .and_then(|p| p.get(&provider.id))
-                        .cloned()
-                        .unwrap_or_else(|| provider.settings_config.clone())
-                } else {
-                    provider.settings_config.clone()
-                }
-            } else {
-                provider.settings_config.clone()
-            };
+            // Native declarations may rely on a built-in definition without a package:
+            // a stored override must stay re-addable after removal from live. The UI
+            // still requires a definition for a new or renamed ID, as it does for V1.
+            let (config_to_write, format) = opencode_config::provider_fragment(
+                &provider.id,
+                &provider.settings_config,
+                provider.opencode_config_format(),
+            )?;
+            if format == OpenCodeConfigFormat::V2 {
+                return opencode_config::set_provider_with_format(
+                    &provider.id,
+                    config_to_write.clone(),
+                    format,
+                );
+            }
 
             // A new ID cannot inherit an existing provider's built-in definition.
             // Check at the write boundary as well as in the UI, including old copies.
@@ -606,12 +631,15 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
 
             // Validate with the existing type, but persist the original fragment:
             // the type does not describe every OpenCode provider/model field.
-            let opencode_config_result =
-                serde_json::from_value::<OpenCodeProviderConfig>(config_to_write.clone());
+            let opencode_config_result = OpenCodeProviderConfig::deserialize(config_to_write);
 
             match opencode_config_result {
                 Ok(_) => {
-                    opencode_config::set_provider(&provider.id, config_to_write)?;
+                    opencode_config::set_provider_with_format(
+                        &provider.id,
+                        config_to_write.clone(),
+                        format,
+                    )?;
                     log::info!("OpenCode provider '{}' written to live config", provider.id);
                 }
                 Err(e) => {
@@ -624,7 +652,11 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
                     if config_to_write.get("npm").is_some()
                         || config_to_write.get("options").is_some()
                     {
-                        opencode_config::set_provider(&provider.id, config_to_write)?;
+                        opencode_config::set_provider_with_format(
+                            &provider.id,
+                            config_to_write.clone(),
+                            format,
+                        )?;
                         log::info!(
                             "OpenCode provider '{}' written as raw JSON to live config",
                             provider.id
@@ -684,12 +716,41 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             crate::hermes_config::set_provider(&provider.id, provider.settings_config.clone())?;
             log::debug!("Hermes provider '{}' written to live config", provider.id);
         }
+        AppType::Dsh => {
+            crate::dsh_config::set_provider(&provider.id, provider.settings_config.clone())?
+        }
+        AppType::Kimi => {
+            crate::kimi_config::set_provider(&provider.id, provider.settings_config.clone())?
+        }
         AppType::Mcode => {
             crate::mcode_config::set_provider(&provider.id, provider.settings_config.clone())?
+        }
+        AppType::WorkBuddy => {
+            // 官方登录卡只绑定账号，没有模型条目：任何写 live 的路径（全量同步等）都跳过它
+            if crate::workbuddy_config::is_official_provider(provider) {
+                return Ok(());
+            }
+            crate::workbuddy_config::set_provider(&provider.id, &provider.settings_config)?
         }
         AppType::Pi => {
             return Err(AppError::InvalidInput(
                 "Pi providers use the Pi provider service".to_string(),
+            ));
+        }
+        AppType::Agy => {
+            return Err(AppError::Config(
+                "Antigravity configuration requires the provider switch flow".into(),
+            ));
+        }
+        AppType::Omp => {
+            return Err(AppError::InvalidInput(
+                "Oh My Pi providers use the Oh My Pi provider service".to_string(),
+            ));
+        }
+        AppType::Copilot => {
+            return Err(AppError::Config(
+                "GitHub Copilot CLI providers are written through the Copilot provider service"
+                    .into(),
             ));
         }
     }
@@ -810,6 +871,32 @@ pub(crate) fn sync_current_provider_for_app_respecting_mode(
     sync_live_for_provider_respecting_mode(state, app_type, provider, None).map(Some)
 }
 
+/// Populate newly encountered DSH profiles with managed providers and enabled MCP servers.
+/// The native writer records completion locally so later native deletions remain intentional.
+pub(crate) fn initialize_dsh_profiles(state: &AppState) -> Result<(), AppError> {
+    let providers = state
+        .db
+        .get_all_providers("dsh")?
+        .into_iter()
+        .filter(|(_, provider)| {
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.live_config_managed)
+                == Some(true)
+        })
+        .map(|(id, provider)| (id, provider.settings_config))
+        .collect();
+    let servers = state
+        .db
+        .get_all_mcp_servers()?
+        .into_iter()
+        .filter(|(_, server)| server.apps.dsh)
+        .map(|(id, server)| (id, server.server))
+        .collect();
+    crate::dsh_config::initialize_profiles(&providers, &servers)
+}
+
 /// Sync current provider to live configuration
 ///
 /// 使用有效的当前供应商 ID（验证过存在性）。
@@ -819,13 +906,24 @@ pub(crate) fn sync_current_provider_for_app_respecting_mode(
 /// For additive mode apps (OpenCode), all providers are synced instead of just the current one.
 pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
     let mut failures = Vec::new();
+    if let Err(error) = initialize_dsh_profiles(state) {
+        failures.push(format!("provider/dsh: {error}"));
+    }
 
     // Sync providers based on mode
     for app_type in AppType::all() {
-        if matches!(app_type, AppType::Pi | AppType::Mcode) {
+        if matches!(
+            app_type,
+            AppType::Pi
+                | AppType::Mcode
+                | AppType::Kimi
+                | AppType::Dsh
+                | AppType::Omp
+                | AppType::Copilot
+        ) {
             continue;
         }
-        let result = if app_type.is_additive_mode() {
+        let result = if app_type.spec().additive {
             // Additive mode: sync ALL providers
             sync_all_providers_to_live(state, &app_type)
         } else {
@@ -978,9 +1076,17 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             Ok(config)
         }
         AppType::Mcode => Ok(json!(crate::mcode_config::get_providers()?)),
+        AppType::Kimi => Ok(json!(crate::kimi_config::get_providers()?)),
+        AppType::Dsh => Ok(json!(crate::dsh_config::get_providers()?)),
+        AppType::WorkBuddy => Ok(json!(crate::workbuddy_config::get_providers()?)),
         AppType::Pi => Err(AppError::InvalidInput(
             "Pi providers are read from Pi's native models file".to_string(),
         )),
+        AppType::Agy => crate::agy_config::read_live_settings(),
+        AppType::Omp => Err(AppError::InvalidInput(
+            "Oh My Pi providers are read from Oh My Pi's native models file".to_string(),
+        )),
+        AppType::Copilot => crate::copilot_config::read_live_settings(),
     }
 }
 
@@ -990,8 +1096,9 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
 /// `Ok(false)` if skipped (providers already exist for this app).
 pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool, AppError> {
     // Additive mode apps (OpenCode, OpenClaw) should use their dedicated
-    // import_xxx_providers_from_live functions, not this generic default config import
-    if app_type.is_additive_mode() {
+    // import_xxx_providers_from_live functions, not this generic default config import.
+    // Copilot 例外：自带模型卡是累加式，官方登录卡仍从 settings.json 导入。
+    if !imports_default_config(&app_type) {
         return Ok(false);
     }
 
@@ -1085,8 +1192,38 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
                 "config": config_obj
             })
         }
+        AppType::Agy => {
+            let live = crate::agy_config::read_live_settings()?;
+            // agy 首次启动就会写出空的 settings.json；没有 Key、端点、模型的配置
+            // 不是用户的供应商，不导入。
+            if !crate::agy_config::has_managed_content(&live) {
+                return Ok(false);
+            }
+            live
+        }
+        AppType::Copilot => {
+            // 刚装好、还没在 Copilot 里选过模型时没有 settings.json：同样没什么可导入，不报错。
+            if !crate::copilot_config::settings_path().exists() {
+                return Ok(false);
+            }
+            let live = crate::copilot_config::read_live_settings()?;
+            // Copilot 首次启动写出的 settings.json 没有模型，不是用户的供应商，不导入。
+            if !crate::copilot_config::has_managed_content(&live) {
+                return Ok(false);
+            }
+            live
+        }
         // OpenCode, OpenClaw and Hermes use additive mode and are handled by early return above
-        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Pi | AppType::Mcode => {
+        // (Copilot is additive too, but its official login card is imported above).
+        AppType::OpenCode
+        | AppType::OpenClaw
+        | AppType::Hermes
+        | AppType::Pi
+        | AppType::Mcode
+        | AppType::Kimi
+        | AppType::Dsh
+        | AppType::Omp
+        | AppType::WorkBuddy => {
             unreachable!("additive mode apps are handled by early return")
         }
     };
@@ -1118,17 +1255,30 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
             } else {
                 "custom"
             }
+        } else if matches!(app_type, AppType::Agy | AppType::Copilot) {
+            // Key 只在进程环境里，从不落盘：从 live 导入的一定是客户端自己的登录。
+            "official"
         } else {
             "custom"
         }
         .to_string(),
     );
 
+    if matches!(app_type, AppType::Copilot) {
+        // 导入的是 Copilot 自己的登录：和预设里的官方卡用同一套名称和图标。
+        provider.name = "GitHub Copilot".to_string();
+        provider.icon = Some("githubcopilot".to_string());
+        provider.website_url = Some("https://github.com/features/copilot/cli".to_string());
+    }
+
     state.db.save_provider(app_type.as_str(), &provider)?;
-    state
-        .db
-        .set_current_provider(app_type.as_str(), &provider.id)?;
-    crate::settings::set_current_provider(&app_type, Some(provider.id.as_str()))?;
+    // Copilot 是累加式，没有直连指针：「默认」看 Copilot 自己的 settings.json。
+    if !app_type.spec().additive {
+        state
+            .db
+            .set_current_provider(app_type.as_str(), &provider.id)?;
+        crate::settings::set_current_provider(&app_type, Some(provider.id.as_str()))?;
+    }
 
     // 初次导入已有配置时随手补出官方入口，对齐其它应用"首启动 = 导入 default
     // + 播种官方条目"的观感。grokbuild 种子晚于 `official_providers_seeded`
@@ -1147,6 +1297,12 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
     Ok(true) // 真正导入了
 }
 
+/// 这个应用是否从 live 导入 `default` 供应商：切换式应用都导入；累加式应用里只有 Copilot
+/// （它的官方登录卡是启动式，从 settings.json 的模型导入，自带模型卡才是累加式）。
+pub(crate) fn imports_default_config(app_type: &AppType) -> bool {
+    !app_type.spec().additive || matches!(app_type, AppType::Copilot)
+}
+
 /// Decide whether startup should auto-import the current live config as `default`.
 ///
 /// This is intentionally stricter than the manual import path:
@@ -1156,7 +1312,7 @@ pub fn should_import_default_config_on_startup(
     state: &AppState,
     app_type: &AppType,
 ) -> Result<bool, AppError> {
-    if app_type.is_additive_mode() {
+    if !imports_default_config(app_type) {
         return Ok(false);
     }
 
@@ -1189,9 +1345,10 @@ pub(crate) fn remove_opencode_provider_from_live(provider_id: &str) -> Result<()
 /// database with is_current set to false.
 pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, AppError> {
     use crate::opencode_config;
-    use crate::provider::OpenCodeProviderConfig;
+    use crate::provider::{OpenCodeConfigFormat, OpenCodeProviderConfig};
+    use serde::Deserialize;
 
-    let providers = opencode_config::get_providers()?;
+    let providers = opencode_config::get_providers_with_format()?;
     if providers.is_empty() {
         return Ok(0);
     }
@@ -1200,28 +1357,43 @@ pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, Ap
     let mut updated = 0;
     let existing_ids = state.db.get_provider_ids("opencode")?;
 
-    for (id, settings_config) in providers {
+    for (id, (settings_config, format)) in providers {
         // Keep validation and display-name extraction separate from persistence.
         // Serializing this partial type would discard fields such as api, env,
         // and models.<id>.limit.input before they ever reach the database.
-        let config = match serde_json::from_value::<OpenCodeProviderConfig>(settings_config.clone())
-        {
-            Ok(config) => config,
-            Err(e) => {
-                log::warn!("Failed to parse provider '{id}': {e}");
-                continue;
+        let name = match format {
+            OpenCodeConfigFormat::V1 => {
+                match OpenCodeProviderConfig::deserialize(&settings_config) {
+                    Ok(config) => config.name,
+                    Err(e) => {
+                        log::warn!("Failed to parse provider '{id}': {e}");
+                        continue;
+                    }
+                }
             }
+            OpenCodeConfigFormat::V2 => settings_config
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         };
+        let native_format =
+            (format == OpenCodeConfigFormat::V2).then_some(OpenCodeConfigFormat::V2);
 
         if existing_ids.contains(&id) {
             match state.db.get_provider_by_id(&id, "opencode") {
                 Ok(Some(existing)) => {
-                    let display_name = config.name.clone().unwrap_or_else(|| existing.name.clone());
-                    if existing.settings_config != settings_config || existing.name != display_name
+                    let display_name = name.clone().unwrap_or_else(|| existing.name.clone());
+                    if existing.settings_config != settings_config
+                        || existing.name != display_name
+                        || existing.opencode_config_format() != native_format
                     {
                         let mut provider = existing;
                         provider.name = display_name;
                         provider.settings_config = settings_config;
+                        provider
+                            .meta
+                            .get_or_insert_with(Default::default)
+                            .opencode_config_format = native_format;
                         if let Err(e) = state.db.save_provider("opencode", &provider) {
                             log::warn!(
                                 "Failed to update OpenCode provider '{id}' from live config: {e}"
@@ -1241,10 +1413,11 @@ pub fn import_opencode_providers_from_live(state: &AppState) -> Result<usize, Ap
         }
 
         // Create provider
-        let display_name = config.name.clone().unwrap_or_else(|| id.clone());
+        let display_name = name.unwrap_or_else(|| id.clone());
         let mut provider = Provider::with_id(id.clone(), display_name, settings_config, None);
         provider.meta = Some(crate::provider::ProviderMeta {
             live_config_managed: Some(true),
+            opencode_config_format: native_format,
             ..Default::default()
         });
 
